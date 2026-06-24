@@ -11,6 +11,7 @@
 //! crate.
 
 pub mod allowlist;
+pub mod discovery;
 pub mod identity;
 pub mod key_storage;
 pub mod pairing;
@@ -21,6 +22,10 @@ pub mod streams;
 pub mod time_scale;
 
 pub use allowlist::{AllowedPeer, AllowlistError, AllowlistStorage, InMemoryAllowlist};
+pub use discovery::{
+    DiscoveredMesh, DiscoveryEvent, EndpointData, EndpointInfo, MeshMetadata,
+    mesh_from_discovery_event,
+};
 pub use identity::{FileKeyStorage, IdentityKey};
 pub use key_storage::{KeyStorage, KeyStorageError};
 pub use pairing::{
