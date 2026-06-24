@@ -26,6 +26,7 @@ pub mod time_scale;
 
 pub use allowlist::{
     AllowedPeer, AllowlistError, AllowlistStorage, FileAllowlistStorage, InMemoryAllowlist,
+    write_pair_allowlist,
 };
 pub use discovery::{
     DiscoveredMesh, DiscoveryEvent, EndpointData, EndpointInfo, MeshMetadata,
