@@ -61,6 +61,8 @@ bincode.workspace = true
 # (used by `FileKeyStorage`), `rt`, `macros`, and `time` (mDNS requery timers).
 # No per-crate feature subset needed.
 tokio.workspace = true
+# `DaemonConfig` serde-serializes to/from `.sync/daemon.toml`.
+toml.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
