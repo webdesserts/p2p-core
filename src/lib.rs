@@ -14,6 +14,7 @@ pub mod allowlist;
 pub mod discovery;
 pub mod identity;
 pub mod key_storage;
+pub mod mesh_mdns;
 pub mod pairing;
 pub mod peer_id;
 pub mod relay;
@@ -28,6 +29,7 @@ pub use discovery::{
 };
 pub use identity::{FileKeyStorage, IdentityKey};
 pub use key_storage::{KeyStorage, KeyStorageError};
+pub use mesh_mdns::{MeshMdns, socket_addrs_to_port_addrs};
 pub use pairing::{
     PairingChallenge, PairingHello, PairingResponse, PairingResult, PairingSession, compute_hmac,
     generate_pairing_code, verify_hmac,
