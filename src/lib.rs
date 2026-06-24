@@ -17,6 +17,7 @@ pub mod pairing;
 pub mod peer_id;
 pub mod relay;
 pub mod relay_class;
+pub mod streams;
 pub mod time_scale;
 
 pub use allowlist::{AllowedPeer, AllowlistError, AllowlistStorage, InMemoryAllowlist};
