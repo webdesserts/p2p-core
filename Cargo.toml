@@ -12,13 +12,19 @@ serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
-# `AllowedPeer` timestamps use `web_time` for a portable SystemTime/Instant.
+# `AllowedPeer`/`PairingSession` timestamps use `web_time` for a portable
+# SystemTime/Instant.
 web-time.workspace = true
+# Pairing HMAC-SHA256 (the only consumer of these in the crate).
+sha2 = "0.10"
+hmac = "0.12"
 # The workspace `tokio` is `features = ["full"]`, which already includes `fs`
 # (used by `FileKeyStorage`), `rt`, and `macros`. No per-crate feature subset needed.
 tokio.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+# The pairing wire-format round-trip tests assert bincode byte-stability.
+bincode.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }
 tempfile.workspace = true

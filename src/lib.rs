@@ -13,9 +13,14 @@
 pub mod allowlist;
 pub mod identity;
 pub mod key_storage;
+pub mod pairing;
 pub mod peer_id;
 
 pub use allowlist::{AllowedPeer, AllowlistError, AllowlistStorage, InMemoryAllowlist};
 pub use identity::{FileKeyStorage, IdentityKey};
 pub use key_storage::{KeyStorage, KeyStorageError};
+pub use pairing::{
+    PairingChallenge, PairingHello, PairingResponse, PairingResult, PairingSession, compute_hmac,
+    generate_pairing_code, verify_hmac,
+};
 pub use peer_id::{PeerId, PeerIdError};
