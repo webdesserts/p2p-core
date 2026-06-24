@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Test-only surface: exposes constructors that simulate constrained network
+# conditions (relay-only endpoints with no IP transports) so downstream
+# integration-test crates can reproduce off-LAN/NAT topologies. Never enabled
+# in production builds. `#[cfg(test)]` would not cross the crate boundary into
+# sync-daemon's integration tests, so this is a feature instead.
+test-util = []
+
 [dependencies]
 ed25519-dalek.workspace = true
 getrandom.workspace = true
@@ -32,6 +40,10 @@ iroh = { version = "1.0.0-rc.1", default-features = false, features = [
     "default",
 ] }
 iroh-relay = { version = "1.0.0-rc.1", features = ["server"] }
+# iroh-gossip — HyParView membership + PlumTree broadcast. The node registers the
+# gossip ALPN + handler and exposes `join_topic`; `GOSSIP_ALPN`/`Gossip`/`TopicId`
+# come from here.
+iroh-gossip = { version = "0.100", default-features = false, features = ["net"] }
 # mDNS mesh discovery actor (native-only, the `obsidian-sync` service).
 mdns-sd = "0.20"
 # BASE32 encoding of the mDNS instance name + relay-url decode.

@@ -15,6 +15,7 @@ pub mod discovery;
 pub mod identity;
 pub mod key_storage;
 pub mod mesh_mdns;
+pub mod node;
 pub mod pairing;
 pub mod pairing_handler;
 pub mod peer_id;
@@ -31,6 +32,7 @@ pub use discovery::{
 pub use identity::{FileKeyStorage, IdentityKey};
 pub use key_storage::{KeyStorage, KeyStorageError};
 pub use mesh_mdns::{MeshMdns, socket_addrs_to_port_addrs};
+pub use node::{P2pNode, topic_from_u64, u64_from_topic};
 pub use pairing::{
     PairingChallenge, PairingHello, PairingResponse, PairingResult, PairingSession, compute_hmac,
     generate_pairing_code, verify_hmac,
@@ -42,3 +44,8 @@ pub use pairing_handler::{
 pub use peer_id::{PeerId, PeerIdError};
 pub use relay::EmbeddedRelay;
 pub use relay_class::relay_is_offlan_reachable;
+
+/// The gossip protocol ALPN, re-exported so sync-core (and the daemon's reconnect
+/// supervisor) can open gossip-bound connections without taking a direct
+/// dependency on `iroh-gossip`.
+pub use iroh_gossip::net::GOSSIP_ALPN;
