@@ -12,6 +12,8 @@ serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+# `FileKeyStorage` reads/writes the key file via tokio's async fs.
+tokio = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 serde_json.workspace = true
