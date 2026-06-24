@@ -2,9 +2,9 @@
 //! sync stack.
 //!
 //! This crate owns the generic, application-agnostic pieces of the iroh-based mesh:
-//! peer identity, key storage, and (in later increments) the node, pairing, relay,
-//! and discovery layers. `sync-core` depends on `p2p-core` and layers the
-//! vault-sync wire protocol on top of it.
+//! peer identity, key storage, the embedded relay, and (in later increments) the
+//! node, pairing, and discovery layers. `sync-core` depends on `p2p-core` and
+//! layers the vault-sync wire protocol on top of it.
 //!
 //! p2p-core is **native-only** — it carries no `cfg(target_arch = "wasm32")`
 //! branches and no `native` feature gate; it simply *is* the native networking
@@ -15,6 +15,8 @@ pub mod identity;
 pub mod key_storage;
 pub mod pairing;
 pub mod peer_id;
+pub mod relay;
+pub mod relay_class;
 
 pub use allowlist::{AllowedPeer, AllowlistError, AllowlistStorage, InMemoryAllowlist};
 pub use identity::{FileKeyStorage, IdentityKey};
@@ -24,3 +26,5 @@ pub use pairing::{
     generate_pairing_code, verify_hmac,
 };
 pub use peer_id::{PeerId, PeerIdError};
+pub use relay::EmbeddedRelay;
+pub use relay_class::relay_is_offlan_reachable;
