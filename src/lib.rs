@@ -24,7 +24,9 @@ pub mod relay_class;
 pub mod streams;
 pub mod time_scale;
 
-pub use allowlist::{AllowedPeer, AllowlistError, AllowlistStorage, InMemoryAllowlist};
+pub use allowlist::{
+    AllowedPeer, AllowlistError, AllowlistStorage, FileAllowlistStorage, InMemoryAllowlist,
+};
 pub use discovery::{
     DiscoveredMesh, DiscoveryEvent, EndpointData, EndpointInfo, MeshMetadata,
     mesh_from_discovery_event,
