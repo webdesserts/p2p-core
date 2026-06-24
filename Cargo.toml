@@ -12,8 +12,11 @@ serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
-# `FileKeyStorage` reads/writes the key file via tokio's async fs.
-tokio = { workspace = true, features = ["fs"] }
+# `AllowedPeer` timestamps use `web_time` for a portable SystemTime/Instant.
+web-time.workspace = true
+# The workspace `tokio` is `features = ["full"]`, which already includes `fs`
+# (used by `FileKeyStorage`), `rt`, and `macros`. No per-crate feature subset needed.
+tokio.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

@@ -10,10 +10,12 @@
 //! branches and no `native` feature gate; it simply *is* the native networking
 //! crate.
 
+pub mod allowlist;
 pub mod identity;
 pub mod key_storage;
 pub mod peer_id;
 
+pub use allowlist::{AllowedPeer, AllowlistError, AllowlistStorage, InMemoryAllowlist};
 pub use identity::{FileKeyStorage, IdentityKey};
 pub use key_storage::{KeyStorage, KeyStorageError};
 pub use peer_id::{PeerId, PeerIdError};
