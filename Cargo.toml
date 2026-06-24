@@ -63,6 +63,9 @@ bincode.workspace = true
 tokio.workspace = true
 # `DaemonConfig` serde-serializes to/from `.sync/daemon.toml`.
 toml.workspace = true
+# `DaemonLock`'s flock-based single-instance guard on `.sync/daemon.lock`.
+# Not a workspace dep — pinned directly, matching sync-daemon's declaration.
+fs2 = "0.4"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

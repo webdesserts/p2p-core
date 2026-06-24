@@ -12,6 +12,7 @@
 
 pub mod allowlist;
 pub mod config;
+pub mod daemon_lock;
 pub mod discovery;
 pub mod identity;
 pub mod key_storage;
@@ -30,6 +31,7 @@ pub use allowlist::{
     write_pair_allowlist,
 };
 pub use config::{DaemonConfig, PeerRelay, persist_config_change};
+pub use daemon_lock::{DaemonLock, LockError};
 pub use discovery::{
     DiscoveredMesh, DiscoveryEvent, EndpointData, EndpointInfo, MeshMetadata,
     mesh_from_discovery_event,
