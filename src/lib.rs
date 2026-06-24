@@ -16,6 +16,7 @@ pub mod identity;
 pub mod key_storage;
 pub mod mesh_mdns;
 pub mod pairing;
+pub mod pairing_handler;
 pub mod peer_id;
 pub mod relay;
 pub mod relay_class;
@@ -33,6 +34,10 @@ pub use mesh_mdns::{MeshMdns, socket_addrs_to_port_addrs};
 pub use pairing::{
     PairingChallenge, PairingHello, PairingResponse, PairingResult, PairingSession, compute_hmac,
     generate_pairing_code, verify_hmac,
+};
+pub use pairing_handler::{
+    InboundPairingExchange, PAIRING_ALPN, PairingApproval, PairingEvent, PairingStreamHandler,
+    pair_with_mesh, pair_with_mesh_interactive,
 };
 pub use peer_id::{PeerId, PeerIdError};
 pub use relay::EmbeddedRelay;
