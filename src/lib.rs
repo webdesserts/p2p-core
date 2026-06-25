@@ -29,7 +29,7 @@ pub mod time_scale;
 
 pub use allowlist::{
     AllowedPeer, AllowlistError, AllowlistStorage, FileAllowlistStorage, InMemoryAllowlist,
-    write_pair_allowlist,
+    PLACEHOLDER_DEVICE_NAME, write_pair_allowlist,
 };
 pub use config::{DaemonConfig, PeerRelay, persist_config_change};
 pub use daemon_lock::{DaemonLock, LockError};
@@ -49,7 +49,7 @@ pub use pairing_handler::{
     InboundPairingExchange, PAIRING_ALPN, PairingApproval, PairingEvent, PairingStreamHandler,
     pair_with_mesh, pair_with_mesh_interactive,
 };
-pub use peer_conn::{PeerConnInfo, PeerConnType, classify_conn_type, classify_remote_info};
+pub use peer_conn::{PeerConnInfo, PeerConnType};
 pub use peer_id::{PeerId, PeerIdError};
 pub use relay::EmbeddedRelay;
 pub use relay_class::relay_is_offlan_reachable;

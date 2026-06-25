@@ -25,6 +25,15 @@ pub enum AllowlistError {
 
 pub type Result<T> = std::result::Result<T, AllowlistError>;
 
+/// Placeholder `device_name` for a peer added from a gossip membership update
+/// before its real name is known.
+///
+/// A peer can land in the allowlist under this placeholder (see
+/// [`write_pair_allowlist`]); the real name self-heals once a gossip
+/// `AllowlistUpdate` arrives. Treat this value as "no meaningful name yet" — it
+/// is not a name to display to users.
+pub const PLACEHOLDER_DEVICE_NAME: &str = "unknown";
+
 /// An authorized peer stored in the allowlist.
 ///
 /// Each entry represents a device that has been paired and is allowed to sync.
@@ -330,7 +339,7 @@ pub async fn write_pair_allowlist<AL: AllowlistStorage>(
     }
 
     for member_id in mesh_members {
-        let peer = AllowedPeer::new(*member_id, "unknown");
+        let peer = AllowedPeer::new(*member_id, PLACEHOLDER_DEVICE_NAME);
         if let Err(e) = allowlist.add_peer(peer.node_id, &peer.device_name).await {
             warn!(
                 "Failed to add mesh member {} to allowlist: {}",

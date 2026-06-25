@@ -53,7 +53,7 @@ pub struct PeerConnInfo {
 /// - Else (no active addr, or only `Custom`/test transports) → `Unknown`.
 ///
 /// `Inactive` addresses are ignored entirely — they are stale or unusable.
-pub fn classify_conn_type<I>(addrs: I) -> PeerConnType
+fn classify_conn_type<I>(addrs: I) -> PeerConnType
 where
     I: IntoIterator<Item = (TransportAddr, TransportAddrUsage)>,
 {
@@ -88,7 +88,7 @@ where
 ///
 /// Thin adapter over [`classify_conn_type`] that pulls the
 /// `(addr, usage)` pairs out of the iroh snapshot.
-pub fn classify_remote_info(info: &RemoteInfo) -> PeerConnType {
+pub(crate) fn classify_remote_info(info: &RemoteInfo) -> PeerConnType {
     classify_conn_type(info.addrs().map(|a| (a.addr().clone(), a.usage())))
 }
 
