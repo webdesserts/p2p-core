@@ -20,6 +20,7 @@ pub mod mesh_mdns;
 pub mod node;
 pub mod pairing;
 pub mod pairing_handler;
+pub mod peer_conn;
 pub mod peer_id;
 pub mod relay;
 pub mod relay_class;
@@ -48,6 +49,7 @@ pub use pairing_handler::{
     InboundPairingExchange, PAIRING_ALPN, PairingApproval, PairingEvent, PairingStreamHandler,
     pair_with_mesh, pair_with_mesh_interactive,
 };
+pub use peer_conn::{PeerConnInfo, PeerConnType, classify_conn_type, classify_remote_info};
 pub use peer_id::{PeerId, PeerIdError};
 pub use relay::EmbeddedRelay;
 pub use relay_class::relay_is_offlan_reachable;

@@ -25,6 +25,7 @@ use tracing::{info, warn};
 use crate::allowlist::AllowlistStorage;
 use crate::mesh_mdns::MeshMdns;
 use crate::pairing_handler::{PAIRING_ALPN, PairingEvent, PairingStreamHandler};
+use crate::peer_conn::{PeerConnInfo, PeerConnType, classify_remote_info};
 
 /// The mDNS service name for obsidian-sync mesh discovery.
 ///
@@ -337,6 +338,21 @@ impl P2pNode {
     /// This node's iroh EndpointId (matches our ed25519 public key).
     pub fn node_id(&self) -> EndpointId {
         self.endpoint.id()
+    }
+
+    /// Snapshot how we are currently reaching `peer`.
+    ///
+    /// Queries iroh's transport state and classifies it into an app-agnostic
+    /// [`PeerConnType`] (LAN / relay / unknown). This is a point-in-time
+    /// snapshot — it may report `Unknown` in the instant a peer first connects
+    /// (before holepunching settles) and self-corrects on later queries. The
+    /// daemon composes the friendly device name on top of this.
+    pub async fn peer_conn_info(&self, peer: EndpointId) -> PeerConnInfo {
+        let conn_type = match self.endpoint.remote_info(peer).await {
+            Some(info) => classify_remote_info(&info),
+            None => PeerConnType::Unknown,
+        };
+        PeerConnInfo { conn_type }
     }
 
     /// Seed a relay hint for a peer into the address-lookup service.
