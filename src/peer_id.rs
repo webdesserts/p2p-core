@@ -92,6 +92,17 @@ impl PeerId {
         // Loro treats 0 as an invalid peer ID.
         if hash == 0 { 1 } else { hash }
     }
+
+    /// True iff these bytes are a valid ed25519 curve point — i.e. a real key that
+    /// can be a transport/dial target.
+    ///
+    /// A legacy/non-curve-point id (16-char hex, UUID) returns `false`. Callers
+    /// that must skip un-dialable allowlist / registry ids gracefully (the daemon's
+    /// bootstrap-seed guards + connect-logging) use this instead of naming iroh's
+    /// `EndpointId`.
+    pub fn is_dialable(&self) -> bool {
+        crate::iroh_adapt::try_peer_to_endpoint(*self).is_ok()
+    }
 }
 
 impl Display for PeerId {
@@ -329,5 +340,31 @@ mod tests {
         let bytes = *peer_id.as_bytes();
         let reconstructed = PeerId::from_bytes(bytes);
         assert_eq!(peer_id, reconstructed);
+    }
+
+    #[test]
+    fn generated_peer_id_is_dialable() {
+        // A real ed25519 keypair is always a valid curve point.
+        assert!(PeerId::generate().is_dialable());
+    }
+
+    #[test]
+    fn legacy_peer_id_is_not_dialable() {
+        // A legacy 16-char-hex id expands to non-curve-point bytes, so it can never
+        // be a transport/dial target — the daemon's guards must skip it gracefully.
+        let legacy: PeerId = "a1b2c3d4e5f67890".parse().unwrap();
+        assert!(!legacy.is_dialable());
+    }
+
+    /// `PeerId::Display` must render the SAME 64-hex string as iroh's `EndpointId`
+    /// for the same key. This is the byte-identity guard for the daemon's
+    /// connect-logging, which logs `%peer_id` where it used to log `%node_id`
+    /// (an `EndpointId`). A future divergence in either Display would silently
+    /// change the connect-log wire-format — this test makes it fail loudly here.
+    #[test]
+    fn peer_id_display_matches_iroh_endpoint_id() {
+        let p = PeerId::generate();
+        let endpoint_id = iroh::EndpointId::from_bytes(p.as_bytes()).unwrap();
+        assert_eq!(format!("{p}"), format!("{endpoint_id}"));
     }
 }

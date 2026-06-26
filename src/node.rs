@@ -110,9 +110,16 @@ impl<A: AllowlistStorage + std::fmt::Debug + 'static> iroh::protocol::ProtocolHa
 /// sync-core's `VaultGossipExt::join_vault_gossip`).
 pub struct P2pNode {
     /// The underlying QUIC endpoint.
-    pub endpoint: Endpoint,
+    ///
+    /// `pub(crate)`: production reaches the endpoint through p2p-core's own methods
+    /// (`connect`, `peer_relay`, `watch_net_changes`, …); integration tests that
+    /// need the raw handle use [`P2pNode::endpoint_for_test`] (test-gated).
+    pub(crate) endpoint: Endpoint,
     /// The gossip subsystem (HyParView + PlumTree).
-    pub gossip: Gossip,
+    ///
+    /// `pub(crate)`: production reaches gossip through `adopt_gossip_connection` /
+    /// the gossip-subscription helpers; no test needs the raw handle.
+    pub(crate) gossip: Gossip,
     /// Inbound pairing events from new devices.
     ///
     /// Drive this in the daemon event loop to process pairing requests.
@@ -128,10 +135,10 @@ pub struct P2pNode {
     /// public relay before mDNS finds them. Also updated at runtime after pairing
     /// and on learn-on-exchange via `add_peer_relay`.
     ///
-    /// Exposed as `pub` so integration tests can inspect hint registration
-    /// without a live connection — the canonical production verification path
-    /// is full gossip connectivity (see relay_integration tests).
-    pub peer_lookup: MemoryLookup,
+    /// `pub(crate)`: integration tests inspect hint registration via
+    /// [`P2pNode::peer_lookup_for_test`] (test-gated); the canonical production
+    /// verification path is full gossip connectivity (see relay_integration tests).
+    pub(crate) peer_lookup: MemoryLookup,
 }
 
 impl P2pNode {
@@ -695,6 +702,27 @@ impl P2pNode {
         self.router.shutdown().await?;
         self.endpoint.close().await;
         Ok(())
+    }
+}
+
+/// Test-only raw-handle accessors.
+///
+/// The `endpoint` / `peer_lookup` fields are `pub(crate)` so production can't reach
+/// the raw iroh handles, but the integration tests need them for harness plumbing
+/// (seed a `MemoryLookup`, await `endpoint.online()`, inspect relay status). The
+/// `feature = "test-util"` half exposes the accessors to the cross-crate
+/// integration tests (which build sync-core / sync-daemon WITHOUT `#[cfg(test)]`);
+/// the `test` half covers p2p-core's own in-crate tests.
+#[cfg(any(test, feature = "test-util"))]
+impl P2pNode {
+    /// The raw iroh endpoint, for test harness plumbing only.
+    pub fn endpoint_for_test(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
+    /// The peer-relay hint lookup, for tests that inspect hint registration.
+    pub fn peer_lookup_for_test(&self) -> &MemoryLookup {
+        &self.peer_lookup
     }
 }
 
