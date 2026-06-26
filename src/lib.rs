@@ -14,6 +14,7 @@ pub mod allowlist;
 pub mod config;
 pub mod daemon_lock;
 pub mod discovery;
+pub mod gossip;
 pub mod identity;
 mod iroh_adapt;
 pub mod key_storage;
@@ -41,6 +42,7 @@ pub use discovery::{
     DiscoveredMesh, DiscoveryEvent, EndpointData, EndpointInfo, MeshMetadata,
     mesh_from_discovery_event,
 };
+pub use gossip::{GossipEvent, GossipHandle, GossipSubscription, Topic};
 pub use identity::{FileKeyStorage, IdentityKey};
 pub use key_storage::{KeyStorage, KeyStorageError};
 pub use mesh_mdns::{MeshMdns, socket_addrs_to_port_addrs};

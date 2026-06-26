@@ -57,6 +57,9 @@ futures.workspace = true
 # The pairing QUIC handler serializes its wire messages with bincode in
 # production code, and the pairing round-trip tests assert byte-stability.
 bincode.workspace = true
+# `bytes::Bytes` is iroh-gossip's payload type; the gossip transport's
+# `broadcast(Bytes)` / `GossipEvent::Data { bytes }` speak it directly.
+bytes = "1"
 # The workspace `tokio` is `features = ["full"]`, which already includes `fs`
 # (used by `FileKeyStorage`), `rt`, `macros`, and `time` (mDNS requery timers).
 # No per-crate feature subset needed.

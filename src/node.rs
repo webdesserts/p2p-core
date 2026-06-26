@@ -11,18 +11,23 @@
 
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
+use futures::StreamExt;
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayMode, SecretKey,
     address_lookup::memory::MemoryLookup,
 };
+use iroh_gossip::api::Event;
 use iroh_gossip::net::GOSSIP_ALPN;
 use iroh_gossip::{Gossip, TopicId};
+use n0_future::task::AbortOnDropHandle;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tokio::sync::mpsc;
+use tracing::{debug, info, warn};
 
 use crate::allowlist::AllowlistStorage;
+use crate::gossip::{GossipEvent, GossipSubscription, Topic};
 use crate::iroh_adapt::{endpoint_to_peer, try_peer_to_endpoint};
 use crate::mesh_mdns::MeshMdns;
 use crate::pairing_handler::{PAIRING_ALPN, PairingEvent, PairingStreamHandler};
@@ -525,6 +530,87 @@ impl P2pNode {
             .subscribe(topic, bootstrap_ids)
             .await
             .context("Failed to subscribe to gossip topic")
+    }
+
+    /// Subscribe to a gossip `topic`, bootstrapping toward `bootstrap` peers.
+    ///
+    /// Returns a generic byte-transport [`GossipSubscription`]: broadcast opaque
+    /// payloads + a stream of generic membership/data events. p2p-core does NOT
+    /// interpret the payload bytes — the app owns its codec (sync-core wraps this
+    /// in a `VaultGossip` that bincode-codecs its `GossipMessage` on top).
+    ///
+    /// At least one bootstrap node is needed to join an existing swarm. Bare
+    /// `EndpointId`s carry no peer data, yet iroh-gossip still auto-publishes this
+    /// node's own `EndpointAddr` as membership peer-data (the warm address-sharing
+    /// channel) — see [`join_topic`](Self::join_topic) for the full note.
+    pub async fn subscribe(
+        &self,
+        topic: Topic,
+        bootstrap: Vec<PeerId>,
+    ) -> Result<GossipSubscription> {
+        // Convert to iroh ids at the boundary, dropping any legacy/non-curve-point
+        // id (it could never be a reachable gossip bootstrap target anyway).
+        let bootstrap_ids: Vec<EndpointId> = bootstrap
+            .into_iter()
+            .filter_map(|p| try_peer_to_endpoint(p).ok())
+            .collect();
+        let gossip_topic = self
+            .gossip
+            .subscribe(topic.as_iroh(), bootstrap_ids)
+            .await
+            .context("Failed to subscribe to gossip topic")?;
+
+        let (sender, mut receiver) = gossip_topic.split();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+
+        // The pump: translate iroh-gossip's events into generic `GossipEvent`s.
+        // Descended verbatim from sync-core's former `VaultGossip::new` loop, with
+        // the ONE change at `Event::Received` — the payload is forwarded OPAQUE
+        // (`bytes: msg.content`) rather than decoded. The app decodes downstream.
+        let task = AbortOnDropHandle::new(n0_future::task::spawn(async move {
+            while let Some(result) = receiver.next().await {
+                let event = match result {
+                    Ok(e) => e,
+                    Err(e) => {
+                        debug!("Gossip stream error: {}", e);
+                        break;
+                    }
+                };
+
+                let gossip_event = match event {
+                    Event::NeighborUp(node_id) => {
+                        // Diagnostic only: the daemon emits the enriched INFO
+                        // connect/disconnect notice off the PeerRegistry liveness
+                        // transition. This is the raw HyParView membership edge.
+                        debug!(peer = %node_id, "Gossip NeighborUp");
+                        GossipEvent::NeighborUp(endpoint_to_peer(node_id))
+                    }
+                    Event::NeighborDown(node_id) => {
+                        debug!(peer = %node_id, "Gossip NeighborDown");
+                        GossipEvent::NeighborDown(endpoint_to_peer(node_id))
+                    }
+                    Event::Received(msg) => {
+                        // Forward the payload OPAQUE — no decode. iroh-gossip's
+                        // `msg.content` is the exact bytes a peer broadcast; the app
+                        // (sync-core's codec wrapper) deserializes downstream.
+                        GossipEvent::Data {
+                            from: endpoint_to_peer(msg.delivered_from),
+                            bytes: msg.content,
+                        }
+                    }
+                    Event::Lagged => {
+                        debug!("Gossip lagged (message buffer overflow)");
+                        GossipEvent::Lagged
+                    }
+                };
+
+                if event_tx.send(gossip_event).is_err() {
+                    break; // Receiver dropped
+                }
+            }
+        }));
+
+        Ok(GossipSubscription::new(sender, topic, event_rx, task))
     }
 
     /// Publish this node's mesh metadata via mDNS so LAN peers can discover it.
