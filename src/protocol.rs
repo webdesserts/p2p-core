@@ -7,7 +7,14 @@
 //! [`Connection`] the trait hands the app is iroh's (Tier-2 re-export) — p2p-core
 //! wraps the EXTENSION POINT, not the raw byte-I/O.
 
-pub use iroh::endpoint::Connection; // Tier-2 re-export (the byte-I/O handle accept() yields)
+// Tier-2 re-exports: the raw QUIC byte-I/O handles. These stay iroh's types,
+// surfaced through p2p-core so consumers (sync-core `streams.rs`, the daemon's
+// `sync_stream.rs`) name them via `p2p_core` and keep `iroh` out of their
+// manifests. `ReadExactError` is included because `read_frame` matches it by
+// variant, so the daemon must name the type. p2p-core wraps the EXTENSION POINT
+// (the handler trait, `connect`), not the byte-I/O — swappable for a real wrapper
+// later behind the same path.
+pub use iroh::endpoint::{Connection, ReadExactError, RecvStream, SendStream};
 
 /// Error returned from a [`ProtocolHandler::accept`].
 ///

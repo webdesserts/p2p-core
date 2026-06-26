@@ -30,7 +30,9 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
+use crate::node::DialHandle;
 use crate::pairing::{PairingChallenge, PairingHello, PairingResponse, PairingResult, verify_hmac};
+use crate::peer_addr::PeerAddr;
 use crate::peer_id::PeerId;
 use crate::streams::{read_length_prefixed, write_length_prefixed};
 
@@ -329,20 +331,20 @@ impl ProtocolHandler for PairingStreamHandler {
 /// Returns an error if the QUIC connection fails, a message cannot be serialized
 /// or deserialized, or the stream ends unexpectedly.
 pub async fn pair_with_mesh(
-    endpoint: &iroh::Endpoint,
-    peer: impl Into<iroh::EndpointAddr>,
+    dial: &DialHandle,
+    peer: PeerAddr,
     hello: &PairingHello,
     code: &str,
 ) -> Result<PairingResult> {
-    // Derive node_id from the endpoint's actual identity, not the caller's hello.
-    let node_id = PeerId::from_bytes(*endpoint.id().as_bytes());
+    // Derive node_id from the node's actual identity, not the caller's hello.
+    let node_id = dial.node_id();
     let hello = PairingHello {
         node_id,
         device_name: hello.device_name.clone(),
     };
 
-    let connection = endpoint
-        .connect(peer, PAIRING_ALPN)
+    let connection = dial
+        .connect(&peer, PAIRING_ALPN)
         .await
         .context("Failed to connect to mesh member for pairing")?;
 
@@ -405,8 +407,8 @@ pub async fn pair_with_mesh(
 /// serialized/deserialized, the stream ends unexpectedly, or `get_code` returns
 /// an error.
 pub async fn pair_with_mesh_interactive<F, Fut>(
-    endpoint: &iroh::Endpoint,
-    peer: impl Into<iroh::EndpointAddr>,
+    dial: &DialHandle,
+    peer: PeerAddr,
     hello: &PairingHello,
     get_code: F,
 ) -> Result<PairingResult>
@@ -414,15 +416,15 @@ where
     F: FnOnce(PairingChallenge) -> Fut,
     Fut: std::future::Future<Output = Result<String>>,
 {
-    // Derive node_id from the endpoint's actual identity, not the caller's hello.
-    let node_id = PeerId::from_bytes(*endpoint.id().as_bytes());
+    // Derive node_id from the node's actual identity, not the caller's hello.
+    let node_id = dial.node_id();
     let hello = PairingHello {
         node_id,
         device_name: hello.device_name.clone(),
     };
 
-    let connection = endpoint
-        .connect(peer, PAIRING_ALPN)
+    let connection = dial
+        .connect(&peer, PAIRING_ALPN)
         .await
         .context("Failed to connect to mesh member for pairing")?;
 
@@ -479,63 +481,72 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    use iroh::protocol::Router;
-    use iroh::{RelayMode, address_lookup::memory::MemoryLookup, endpoint::presets};
+    use iroh::address_lookup::memory::MemoryLookup;
+
+    use crate::allowlist::InMemoryAllowlist;
+    use crate::node::P2pNode;
+    use crate::protocol::{AcceptError, Connection, ProtocolHandler};
 
     fn seed(n: u8) -> [u8; 32] {
         [n; 32]
     }
 
-    /// Build a test endpoint registered with the pairing ALPN.
-    ///
-    /// Returns the endpoint, the pairing event receiver, and the router
-    /// (kept alive to maintain the protocol handler).
-    async fn make_pairing_test_node(
-        secret_key_bytes: [u8; 32],
-    ) -> anyhow::Result<(
-        iroh::Endpoint,
-        mpsc::UnboundedReceiver<PairingEvent>,
-        Router,
-    )> {
-        use ed25519_dalek::SigningKey;
-        use iroh::{Endpoint, SecretKey};
+    /// A no-op sync handler so the test node can be built via the production
+    /// `P2pNode::with_sync_alpn` seam (which registers GOSSIP + SYNC + PAIRING).
+    /// The pairing tests only drive `PAIRING_ALPN`; nothing connects on the sync
+    /// ALPN, so this handler is never called.
+    #[derive(Debug)]
+    struct NoopSyncHandler;
 
-        let signing_key = SigningKey::from_bytes(&secret_key_bytes);
-        let secret_key = SecretKey::from_bytes(&signing_key.to_bytes());
-
-        let endpoint = Endpoint::builder(presets::Minimal)
-            .secret_key(secret_key)
-            .relay_mode(RelayMode::Disabled)
-            .bind()
-            .await?;
-
-        // The pairing tests only drive PAIRING_ALPN; the gossip/sync handlers that
-        // the production router also registers live in sync-core and aren't
-        // exercised here, so this router accepts the pairing protocol alone.
-        let (pairing_handler, pairing_rx) = PairingStreamHandler::new();
-
-        let router = Router::builder(endpoint.clone())
-            .accept(PAIRING_ALPN, pairing_handler)
-            .spawn();
-
-        let memory_lookup = MemoryLookup::new();
-        endpoint.address_lookup()?.add(memory_lookup);
-
-        Ok((endpoint, pairing_rx, router))
+    impl ProtocolHandler for NoopSyncHandler {
+        async fn accept(&self, _connection: Connection) -> Result<(), AcceptError> {
+            Ok(())
+        }
     }
 
-    /// Teach two endpoints how to reach each other directly (no relay).
-    async fn connect_pair(ep_a: &iroh::Endpoint, ep_b: &iroh::Endpoint) -> anyhow::Result<()> {
-        let addr_a = ep_a.addr();
-        let addr_b = ep_b.addr();
+    /// Build a test `P2pNode` registered with the pairing ALPN (and the gossip +
+    /// sync ALPNs, via the production seam).
+    ///
+    /// Returns the node and the pairing event receiver. The node's router stays
+    /// alive as long as the node does, so callers keep the node bound for the test.
+    async fn make_pairing_test_node(
+        secret_key_bytes: [u8; 32],
+    ) -> anyhow::Result<(P2pNode, mpsc::UnboundedReceiver<PairingEvent>)> {
+        // No relays: the tests teach the two nodes each other's direct addrs via
+        // `connect_pair`, so the relay-disabled (LAN-direct) path is exercised. The
+        // sync ALPN is a test-only literal distinct from GOSSIP/PAIRING; nothing
+        // connects on it, so the `NoopSyncHandler` is never driven.
+        const TEST_SYNC_ALPN: &[u8] = b"p2p-core-test/sync/1";
+        let allowlist = Arc::new(InMemoryAllowlist::new());
+        let mut node = P2pNode::with_sync_alpn(
+            secret_key_bytes,
+            &[],
+            allowlist,
+            TEST_SYNC_ALPN,
+            NoopSyncHandler,
+        )
+        .await?;
+        // The pairing handler's inbound channel lives on the node; take its receiver
+        // so the test can drive the mesh-member side.
+        let pairing_rx = std::mem::replace(
+            &mut node.inbound_pairing_rx,
+            mpsc::unbounded_channel().1, // replace with a dead receiver
+        );
+        Ok((node, pairing_rx))
+    }
+
+    /// Teach two nodes how to reach each other directly (no relay).
+    async fn connect_pair(node_a: &P2pNode, node_b: &P2pNode) -> anyhow::Result<()> {
+        let addr_a = node_a.endpoint.addr();
+        let addr_b = node_b.endpoint.addr();
 
         let lookup_a = MemoryLookup::new();
         lookup_a.add_endpoint_info(addr_b.clone());
-        ep_a.address_lookup()?.add(lookup_a);
+        node_a.endpoint.address_lookup()?.add(lookup_a);
 
         let lookup_b = MemoryLookup::new();
         lookup_b.add_endpoint_info(addr_a.clone());
-        ep_b.address_lookup()?.add(lookup_b);
+        node_b.endpoint.address_lookup()?.add(lookup_b);
 
         Ok(())
     }
@@ -548,13 +559,12 @@ mod tests {
     /// console and types it into the new device.
     #[tokio::test]
     async fn successful_pairing_with_correct_code() -> anyhow::Result<()> {
-        let (mesh_ep, mut mesh_rx, _mesh_router) = make_pairing_test_node(seed(1)).await?;
-        let (new_ep, _new_rx, _new_router) = make_pairing_test_node(seed(2)).await?;
-        connect_pair(&mesh_ep, &new_ep).await?;
+        let (mesh_node, mut mesh_rx) = make_pairing_test_node(seed(1)).await?;
+        let (new_node, _new_rx) = make_pairing_test_node(seed(2)).await?;
+        connect_pair(&mesh_node, &new_node).await?;
 
-        let mesh_addr = mesh_ep.addr();
-        let new_peer_id = PeerId::from_bytes(*new_ep.id().as_bytes());
-        let mesh_peer_id = PeerId::from_bytes(*mesh_ep.id().as_bytes());
+        let new_peer_id = new_node.node_id();
+        let mesh_peer_id = mesh_node.node_id();
 
         // Pre-agreed code for the test (normally the user reads this from the console).
         let test_code = "042817";
@@ -597,9 +607,10 @@ mod tests {
             device_name: "MacBook Pro".to_string(),
         };
         let client_task = tokio::spawn(async move {
+            let dial = new_node.dial_handle();
             let result = tokio::time::timeout(
                 Duration::from_secs(10),
-                pair_with_mesh(&new_ep, mesh_addr, &hello, test_code),
+                pair_with_mesh(&dial, PeerAddr::new(mesh_peer_id), &hello, test_code),
             )
             .await
             .expect("client timeout")?;
@@ -628,13 +639,12 @@ mod tests {
     /// Wrong code: HMAC mismatch causes pairing to fail on both sides.
     #[tokio::test]
     async fn failed_pairing_with_wrong_code() -> anyhow::Result<()> {
-        let (mesh_ep, mut mesh_rx, _mesh_router) = make_pairing_test_node(seed(3)).await?;
-        let (new_ep, _new_rx, _new_router) = make_pairing_test_node(seed(4)).await?;
-        connect_pair(&mesh_ep, &new_ep).await?;
+        let (mesh_node, mut mesh_rx) = make_pairing_test_node(seed(3)).await?;
+        let (new_node, _new_rx) = make_pairing_test_node(seed(4)).await?;
+        connect_pair(&mesh_node, &new_node).await?;
 
-        let mesh_addr = mesh_ep.addr();
-        let new_peer_id = PeerId::from_bytes(*new_ep.id().as_bytes());
-        let mesh_peer_id = PeerId::from_bytes(*mesh_ep.id().as_bytes());
+        let new_peer_id = new_node.node_id();
+        let mesh_peer_id = mesh_node.node_id();
 
         // Mesh side: approve with code "123456" and expect PairingFailed.
         let mesh_task = tokio::spawn(async move {
@@ -673,9 +683,10 @@ mod tests {
             device_name: "iPhone".to_string(),
         };
         let client_task = tokio::spawn(async move {
+            let dial = new_node.dial_handle();
             let result = tokio::time::timeout(
                 Duration::from_secs(10),
-                pair_with_mesh(&new_ep, mesh_addr, &hello, "999999"),
+                pair_with_mesh(&dial, PeerAddr::new(mesh_peer_id), &hello, "999999"),
             )
             .await
             .expect("client timeout")?;
@@ -709,12 +720,12 @@ mod tests {
     /// a 5-minute timeout would make the test impractical.
     #[tokio::test]
     async fn rejected_when_approval_dropped() -> anyhow::Result<()> {
-        let (mesh_ep, mut mesh_rx, _mesh_router) = make_pairing_test_node(seed(5)).await?;
-        let (new_ep, _new_rx, _new_router) = make_pairing_test_node(seed(6)).await?;
-        connect_pair(&mesh_ep, &new_ep).await?;
+        let (mesh_node, mut mesh_rx) = make_pairing_test_node(seed(5)).await?;
+        let (new_node, _new_rx) = make_pairing_test_node(seed(6)).await?;
+        connect_pair(&mesh_node, &new_node).await?;
 
-        let mesh_addr = mesh_ep.addr();
-        let new_peer_id = PeerId::from_bytes(*new_ep.id().as_bytes());
+        let mesh_peer_id = mesh_node.node_id();
+        let new_peer_id = new_node.node_id();
 
         // Mesh side: drop the reply_tx immediately (simulates daemon rejection).
         tokio::spawn(async move {
@@ -734,9 +745,10 @@ mod tests {
 
         // The client side sees the stream close without a challenge — this should
         // produce an error (not a successful PairingResult with success=false).
+        let dial = new_node.dial_handle();
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            pair_with_mesh(&new_ep, mesh_addr, &hello, "000000"),
+            pair_with_mesh(&dial, PeerAddr::new(mesh_peer_id), &hello, "000000"),
         )
         .await
         .expect("test timed out");
@@ -760,12 +772,12 @@ mod tests {
     /// will fail — the mesh member binds the HMAC to the actual QUIC identity.
     #[tokio::test]
     async fn pairing_fails_when_node_id_mismatches_quic_identity() -> anyhow::Result<()> {
-        let (mesh_ep, mut mesh_rx, _mesh_router) = make_pairing_test_node(seed(7)).await?;
-        let (new_ep, _new_rx, _new_router) = make_pairing_test_node(seed(8)).await?;
-        connect_pair(&mesh_ep, &new_ep).await?;
+        let (mesh_node, mut mesh_rx) = make_pairing_test_node(seed(7)).await?;
+        let (new_node, _new_rx) = make_pairing_test_node(seed(8)).await?;
+        connect_pair(&mesh_node, &new_node).await?;
 
-        let mesh_addr = mesh_ep.addr();
-        let mesh_peer_id = PeerId::from_bytes(*mesh_ep.id().as_bytes());
+        let mesh_addr = mesh_node.endpoint.addr();
+        let mesh_peer_id = mesh_node.node_id();
 
         // A fake identity that doesn't match the QUIC connection's actual remote_id.
         let fake_peer_id = PeerId::from_bytes([0xFFu8; 32]);
@@ -807,7 +819,8 @@ mod tests {
         // node_id, then compute the HMAC over that fake identity. The mesh member
         // will verify against the real transport identity and reject.
         let client_task = tokio::spawn(async move {
-            let connection = new_ep
+            let connection = new_node
+                .endpoint
                 .connect(mesh_addr, PAIRING_ALPN)
                 .await
                 .expect("connect failed");

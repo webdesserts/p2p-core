@@ -44,7 +44,7 @@ pub use discovery::{
 pub use identity::{FileKeyStorage, IdentityKey};
 pub use key_storage::{KeyStorage, KeyStorageError};
 pub use mesh_mdns::{MeshMdns, socket_addrs_to_port_addrs};
-pub use node::{P2pNode, topic_from_u64, u64_from_topic};
+pub use node::{DialHandle, P2pNode, topic_from_u64, u64_from_topic};
 pub use pairing::{
     PairingChallenge, PairingHello, PairingResponse, PairingResult, PairingSession, compute_hmac,
     generate_pairing_code, verify_hmac,
@@ -56,7 +56,9 @@ pub use pairing_handler::{
 pub use peer_addr::PeerAddr;
 pub use peer_conn::{PeerConnInfo, PeerConnType};
 pub use peer_id::{PeerId, PeerIdError};
-pub use protocol::{AcceptError, Connection, ProtocolHandler};
+pub use protocol::{
+    AcceptError, Connection, ProtocolHandler, ReadExactError, RecvStream, SendStream,
+};
 pub use relay::EmbeddedRelay;
 pub use relay_addr::{RelayAddr, RelayAddrError};
 pub use relay_class::relay_is_offlan_reachable;

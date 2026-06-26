@@ -45,12 +45,8 @@ impl PeerAddr {
     /// Fails iff `peer` is a legacy / non-curve-point id (mirrors
     /// [`crate::iroh_adapt::try_peer_to_endpoint`]) — a `PeerAddr` may carry an
     /// allowlist-sourced id in the reconnect-supervisor path, so the conversion
-    /// must degrade rather than panic. p2p-core-internal.
-    ///
-    /// `allow(dead_code)`: the dial-side caller (`P2pNode::connect` /
-    /// `pair_with_mesh*`) arrives in the next increment; the type ships first so
-    /// it can replace `iroh::EndpointAddr` in signatures incrementally.
-    #[allow(dead_code)]
+    /// must degrade rather than panic. p2p-core-internal (used by the dial path:
+    /// `DialHandle::connect` / `pair_with_mesh*`).
     pub(crate) fn try_into_iroh(&self) -> Result<iroh::EndpointAddr, iroh::KeyParsingError> {
         let endpoint_id = crate::iroh_adapt::try_peer_to_endpoint(self.peer)?;
         let mut addr = iroh::EndpointAddr::new(endpoint_id);

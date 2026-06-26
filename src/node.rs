@@ -26,9 +26,10 @@ use crate::allowlist::AllowlistStorage;
 use crate::iroh_adapt::{endpoint_to_peer, try_peer_to_endpoint};
 use crate::mesh_mdns::MeshMdns;
 use crate::pairing_handler::{PAIRING_ALPN, PairingEvent, PairingStreamHandler};
+use crate::peer_addr::PeerAddr;
 use crate::peer_conn::{PeerConnInfo, PeerConnType, classify_remote_info};
 use crate::peer_id::PeerId;
-use crate::protocol::IrohHandlerAdapter;
+use crate::protocol::{Connection, IrohHandlerAdapter};
 use crate::relay_addr::RelayAddr;
 
 /// The mDNS service name for obsidian-sync mesh discovery.
@@ -631,11 +632,128 @@ impl P2pNode {
         Some(mdns.subscribe().await)
     }
 
+    /// A cheap-cloneable handle for dialing + gossip-adoption from a detached task.
+    ///
+    /// Holds clones of the endpoint + gossip (both cheap `Clone`), so a spawned
+    /// task that outlives the node's owner does NOT keep the node alive — unlike an
+    /// `Arc<P2pNode>`, which would block `shutdown(self)`'s consume (an in-flight
+    /// `Arc::clone` makes `Arc::into_inner` return `None` → shutdown silently
+    /// skipped). The reconnect supervisor's bootstrap/sync-exchange tasks capture
+    /// this; `sync_node` stays OWNED.
+    pub fn dial_handle(&self) -> DialHandle {
+        DialHandle {
+            endpoint: self.endpoint.clone(),
+            gossip: self.gossip.clone(),
+        }
+    }
+
+    /// Dial `peer` on `alpn`, returning the raw QUIC [`Connection`] (Tier-2).
+    ///
+    /// The app opens its own streams on the returned connection (`open_bi()`) and
+    /// frames bytes — p2p-core owns "dial this peer on this ALPN," the app owns the
+    /// byte protocol. Absorbs the daemon's former raw `endpoint.connect(...)` sites
+    /// (sync-exchange pump, supervisor bootstrap, pairing).
+    ///
+    /// FALLIBLE on a legacy/non-curve-point `PeerAddr` (returns the connect error);
+    /// callers holding a transport-sourced id will never hit that arm.
+    pub async fn connect(&self, peer: &PeerAddr, alpn: &[u8]) -> Result<Connection> {
+        self.dial_handle().connect(peer, alpn).await
+    }
+
+    /// The peer's currently-active relay URL, if it is reachable via a relay right now.
+    ///
+    /// Snapshots iroh's `remote_info(peer)` and returns the first address that is
+    /// both `Active` and a relay path — the URL learn-on-exchange should refresh
+    /// the stored hint to. `None` for a LAN-direct connection (no active relay path)
+    /// or an unknown/legacy peer. Mirrors `peer_conn_info`'s graceful degrade.
+    pub async fn peer_relay(&self, peer: PeerId) -> Option<RelayAddr> {
+        self.dial_handle().peer_relay(peer).await
+    }
+
+    /// Hand an externally-established [`Connection`] to the gossip subsystem, which
+    /// adopts it exactly as it adopts an inbound accept (drains the queued Join →
+    /// peer Active → NeighborUp). Used by the reconnect supervisor's bootstrap-connect
+    /// to recover a peer whose bare-id gossip dial parked.
+    pub async fn adopt_gossip_connection(&self, conn: Connection) -> Result<()> {
+        self.dial_handle().adopt_gossip_connection(conn).await
+    }
+
+    /// A stream that yields `()` each time iroh observes a network address change
+    /// (relay or direct addrs changed). Drives the daemon's reconnect-backoff reset.
+    /// Hides `iroh::Watcher` + `watch_addr().stream_updates_only()`.
+    ///
+    /// `stream_updates_only` (not `stream`) skips the current address, so this
+    /// reacts only to real changes — no spurious emission at startup.
+    pub fn watch_net_changes(&self) -> impl n0_future::Stream<Item = ()> + Unpin + use<> {
+        use futures::StreamExt;
+        use iroh::Watcher;
+        self.endpoint.watch_addr().stream_updates_only().map(|_| ())
+    }
+
     /// Shut down the node, closing all connections.
     pub async fn shutdown(self) -> Result<()> {
         self.router.shutdown().await?;
         self.endpoint.close().await;
         Ok(())
+    }
+}
+
+/// A cheap-cloneable dial + gossip-adoption handle (see [`P2pNode::dial_handle`]).
+///
+/// Bundles clones of the endpoint + gossip behind one named handle plus the dial
+/// logic, so detached supervisor tasks can `connect` / `adopt_gossip_connection` /
+/// `peer_relay` without holding an `Arc<P2pNode>` that would block the node's
+/// consuming `shutdown(self)`. The `P2pNode` methods of the same names delegate
+/// here, keeping one source of truth for the dial logic.
+#[derive(Clone)]
+pub struct DialHandle {
+    endpoint: Endpoint,
+    gossip: Gossip,
+}
+
+impl DialHandle {
+    /// This node's [`PeerId`] (matches our ed25519 public key) — same value as
+    /// [`P2pNode::node_id`]. Lets a detached task that holds only a `DialHandle`
+    /// (e.g. the parked pairing exchange) derive the local identity without the
+    /// node.
+    pub fn node_id(&self) -> PeerId {
+        endpoint_to_peer(self.endpoint.id())
+    }
+
+    /// See [`P2pNode::connect`].
+    pub async fn connect(&self, peer: &PeerAddr, alpn: &[u8]) -> Result<Connection> {
+        let addr = peer
+            .try_into_iroh()
+            .map_err(|e| anyhow::anyhow!("connect target is not a valid key: {e}"))?;
+        Ok(self.endpoint.connect(addr, alpn).await?)
+    }
+
+    /// See [`P2pNode::adopt_gossip_connection`].
+    pub async fn adopt_gossip_connection(&self, conn: Connection) -> Result<()> {
+        self.gossip
+            .handle_connection(conn)
+            .await
+            .map_err(|e| anyhow::anyhow!("gossip rejected adopted connection: {e}"))
+    }
+
+    /// See [`P2pNode::peer_relay`].
+    pub async fn peer_relay(&self, peer: PeerId) -> Option<RelayAddr> {
+        use iroh::TransportAddr;
+        use iroh::endpoint::TransportAddrUsage;
+
+        let endpoint_id = try_peer_to_endpoint(peer).ok()?;
+        let info = self.endpoint.remote_info(endpoint_id).await?;
+        // VERBATIM the daemon's former `active_relay_url` selection: the first
+        // address that is both currently `Active` and a relay path is the URL the
+        // peer is reachable at right now. Round-trip the relay through its string
+        // form (lossless for a valid relay URL) so the caller never names iroh's
+        // URL type. A LAN-direct connection has no active relay path → `None`.
+        info.addrs().find_map(|a| match (a.usage(), a.addr()) {
+            (TransportAddrUsage::Active, TransportAddr::Relay(url)) => {
+                RelayAddr::parse(&url.to_string()).ok()
+            }
+            _ => None,
+        })
     }
 }
 
