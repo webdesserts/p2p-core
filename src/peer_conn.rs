@@ -15,6 +15,8 @@ use iroh::RelayUrl;
 use iroh::TransportAddr;
 use iroh::endpoint::{RemoteInfo, TransportAddrUsage};
 
+use crate::relay_addr::RelayAddr;
+
 /// How we are currently reaching a peer.
 ///
 /// `Lan` is the operationally interesting "we got off the relay" state and is
@@ -25,7 +27,7 @@ pub enum PeerConnType {
     /// Direct IP/LAN path — carries the remote socket address.
     Lan { addr: SocketAddr },
     /// Relay-routed path — carries the relay URL.
-    Relay { url: RelayUrl },
+    Relay { url: RelayAddr },
     /// No active transport path is known (e.g. `remote_info` returned `None`,
     /// the peer is mid-holepunch, or only a test/custom transport is active).
     Unknown,
@@ -79,7 +81,9 @@ where
     }
 
     match relay_url {
-        Some(url) => PeerConnType::Relay { url },
+        Some(url) => PeerConnType::Relay {
+            url: RelayAddr::from_iroh(url),
+        },
         None => PeerConnType::Unknown,
     }
 }

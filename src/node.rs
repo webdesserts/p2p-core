@@ -14,7 +14,7 @@ use ed25519_dalek::SigningKey;
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey,
+    Endpoint, EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayMode, SecretKey,
     address_lookup::memory::MemoryLookup,
 };
 use iroh_gossip::net::GOSSIP_ALPN;
@@ -26,6 +26,7 @@ use crate::allowlist::AllowlistStorage;
 use crate::mesh_mdns::MeshMdns;
 use crate::pairing_handler::{PAIRING_ALPN, PairingEvent, PairingStreamHandler};
 use crate::peer_conn::{PeerConnInfo, PeerConnType, classify_remote_info};
+use crate::relay_addr::RelayAddr;
 
 /// The mDNS service name for obsidian-sync mesh discovery.
 ///
@@ -147,7 +148,7 @@ impl P2pNode {
     /// silently shadows a same-named trait fn at `Type::func` call sites.
     pub async fn with_sync_alpn<A, H>(
         secret_key_bytes: [u8; 32],
-        relays: &[RelayUrl],
+        relays: &[RelayAddr],
         allowlist: Arc<A>,
         sync_alpn: &'static [u8],
         sync_handler: H,
@@ -181,7 +182,7 @@ impl P2pNode {
     #[cfg(feature = "test-util")]
     pub async fn relay_only_with_sync_alpn<A, H>(
         secret_key_bytes: [u8; 32],
-        relays: &[RelayUrl],
+        relays: &[RelayAddr],
         allowlist: Arc<A>,
         sync_alpn: &'static [u8],
         sync_handler: H,
@@ -208,7 +209,7 @@ impl P2pNode {
     /// `test-util` relay-only constructor passes `true`.
     async fn build<A, H>(
         secret_key_bytes: [u8; 32],
-        relays: &[RelayUrl],
+        relays: &[RelayAddr],
         allowlist: Arc<A>,
         relay_only: bool,
         sync_alpn: &'static [u8],
@@ -233,7 +234,9 @@ impl P2pNode {
             // Home on this SET of relays: iroh selects the lowest-latency reachable
             // one and fails over across the rest (net-report only probes RelayMap
             // members, so the set IS the home/failover candidate list).
-            RelayMode::Custom(RelayMap::from_iter(relays.iter().cloned()))
+            RelayMode::Custom(RelayMap::from_iter(
+                relays.iter().map(|r| r.as_iroh().clone()),
+            ))
         };
 
         // `presets::Minimal`, NOT `presets::N0` — deliberate and load-bearing.
@@ -365,7 +368,7 @@ impl P2pNode {
     /// If the relay is unreachable off-LAN, connection attempts through that hint
     /// will simply fail; there is no automatic fallback to mDNS off-LAN because
     /// mDNS does not operate across network boundaries.
-    pub fn add_peer_relay(&self, endpoint_id: EndpointId, relay_url: &RelayUrl) {
+    pub fn add_peer_relay(&self, endpoint_id: EndpointId, relay_url: &RelayAddr) {
         if endpoint_id == self.node_id() {
             tracing::warn!(
                 "add_peer_relay called with our own EndpointId — ignoring to prevent \
@@ -373,7 +376,7 @@ impl P2pNode {
             );
             return;
         }
-        let addr = EndpointAddr::new(endpoint_id).with_relay_url(relay_url.clone());
+        let addr = EndpointAddr::new(endpoint_id).with_relay_url(relay_url.as_iroh().clone());
         self.peer_lookup.add_endpoint_info(addr);
     }
 
@@ -389,14 +392,15 @@ impl P2pNode {
     /// Idempotent at the iroh layer: `insert_relay` replaces any existing config for
     /// the URL and returns the prior one (ignored here). Returns without effect if
     /// the endpoint is closed (`insert_relay` yields `None`).
-    pub async fn add_home_relay(&self, relay_url: &RelayUrl) {
+    pub async fn add_home_relay(&self, relay_url: &RelayAddr) {
+        let iroh_url = relay_url.as_iroh();
         self.endpoint
             .insert_relay(
-                relay_url.clone(),
-                Arc::new(RelayConfig::from(relay_url.clone())),
+                iroh_url.clone(),
+                Arc::new(RelayConfig::from(iroh_url.clone())),
             )
             .await;
-        tracing::info!(relay_url = %relay_url, "Added learned public relay to live RelayMap");
+        tracing::info!(relay_url = %relay_url.as_str(), "Added learned public relay to live RelayMap");
     }
 
     /// Replace a peer's relay hint in the address-lookup service.
@@ -407,7 +411,7 @@ impl P2pNode {
     /// before re-bootstrapping, and learn-on-exchange replaces a moved peer's relay.
     /// A union would let a stale, dead relay URL linger alongside the fresh one and
     /// keep getting dialed; the overwrite guarantees only the latest hint remains.
-    pub fn set_peer_relay(&self, endpoint_id: EndpointId, relay_url: &RelayUrl) {
+    pub fn set_peer_relay(&self, endpoint_id: EndpointId, relay_url: &RelayAddr) {
         if endpoint_id == self.node_id() {
             tracing::warn!(
                 "set_peer_relay called with our own EndpointId — ignoring to prevent \
@@ -415,7 +419,7 @@ impl P2pNode {
             );
             return;
         }
-        let addr = EndpointAddr::new(endpoint_id).with_relay_url(relay_url.clone());
+        let addr = EndpointAddr::new(endpoint_id).with_relay_url(relay_url.as_iroh().clone());
         self.peer_lookup.set_endpoint_info(addr);
     }
 
@@ -487,7 +491,7 @@ impl P2pNode {
     pub fn publish_mesh_info(
         &self,
         metadata: &crate::discovery::MeshMetadata,
-        relay_url: Option<&RelayUrl>,
+        relay_url: Option<&RelayAddr>,
     ) {
         use crate::mesh_mdns::socket_addrs_to_port_addrs;
 
@@ -526,7 +530,8 @@ impl P2pNode {
         }
 
         // Set relay URL TXT attribute (routed through actor, sequenced after addrs).
-        mdns.set_relay_url(relay_url.map(|u| u.as_str()));
+        let relay_url_str = relay_url.map(|u| u.as_str());
+        mdns.set_relay_url(relay_url_str.as_deref());
 
         info!(mesh = %metadata.mesh, vid = %metadata.vid, "Published mesh info via mDNS");
     }

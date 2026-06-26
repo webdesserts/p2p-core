@@ -5,6 +5,7 @@
 //! sockets can route traffic through this relay. No TLS is required for LAN use;
 //! for internet exposure, sit a reverse proxy (e.g. Caddy) in front.
 
+use crate::relay_addr::RelayAddr;
 use anyhow::{Context, Result};
 use iroh::RelayUrl;
 use iroh_relay::server::{RelayConfig, Server, ServerConfig};
@@ -17,7 +18,7 @@ use tracing::info;
 /// For a clean shutdown, call [`EmbeddedRelay::shutdown`] instead.
 pub struct EmbeddedRelay {
     server: Server,
-    url: RelayUrl,
+    url: RelayAddr,
 }
 
 impl EmbeddedRelay {
@@ -44,7 +45,10 @@ impl EmbeddedRelay {
 
         info!(url = %url, "Embedded relay server started");
 
-        Ok(Self { server, url })
+        Ok(Self {
+            server,
+            url: RelayAddr::from_iroh(url),
+        })
     }
 
     /// Start an embedded relay server bound to `bind_addr`, advertising `advertised_url`
@@ -74,7 +78,10 @@ impl EmbeddedRelay {
 
         info!(url = %url, "Embedded relay server started (advertised URL differs from bind address)");
 
-        Ok(Self { server, url })
+        Ok(Self {
+            server,
+            url: RelayAddr::from_iroh(url),
+        })
     }
 
     /// Spawn the iroh relay server on `bind_addr`.
@@ -92,7 +99,7 @@ impl EmbeddedRelay {
     ///
     /// Pass this to the node constructor so the iroh endpoint advertises and uses
     /// the embedded relay for peer connections.
-    pub fn relay_url(&self) -> &RelayUrl {
+    pub fn relay_url(&self) -> &RelayAddr {
         &self.url
     }
 
@@ -115,7 +122,7 @@ mod tests {
 
         // The server must have bound to some real port (not 0).
         let url = relay.relay_url();
-        let host = url.host_str().unwrap();
+        let host = url.host().unwrap();
         assert_eq!(host, "127.0.0.1");
 
         let port = url.port().unwrap();
@@ -129,7 +136,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let relay = EmbeddedRelay::start(addr).await.unwrap();
 
-        let url_str = relay.relay_url().to_string();
+        let url_str = relay.relay_url().as_str();
         assert!(
             url_str.starts_with("http://"),
             "expected http://, got {url_str}"
@@ -164,7 +171,7 @@ mod tests {
             .unwrap();
 
         // The relay_url() must return the advertised URL, not the bound address.
-        assert_eq!(relay.relay_url().to_string(), advertised);
+        assert_eq!(relay.relay_url().as_str(), advertised);
 
         relay.shutdown().await;
     }
