@@ -21,6 +21,7 @@ pub mod mesh_mdns;
 pub mod node;
 pub mod pairing;
 pub mod pairing_handler;
+pub mod peer_addr;
 pub mod peer_conn;
 pub mod peer_id;
 pub mod relay;
@@ -51,6 +52,7 @@ pub use pairing_handler::{
     InboundPairingExchange, PAIRING_ALPN, PairingApproval, PairingEvent, PairingStreamHandler,
     pair_with_mesh, pair_with_mesh_interactive,
 };
+pub use peer_addr::PeerAddr;
 pub use peer_conn::{PeerConnInfo, PeerConnType};
 pub use peer_id::{PeerId, PeerIdError};
 pub use relay::EmbeddedRelay;
