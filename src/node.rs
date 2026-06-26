@@ -28,6 +28,7 @@ use crate::mesh_mdns::MeshMdns;
 use crate::pairing_handler::{PAIRING_ALPN, PairingEvent, PairingStreamHandler};
 use crate::peer_conn::{PeerConnInfo, PeerConnType, classify_remote_info};
 use crate::peer_id::PeerId;
+use crate::protocol::IrohHandlerAdapter;
 use crate::relay_addr::RelayAddr;
 
 /// The mDNS service name for obsidian-sync mesh discovery.
@@ -155,7 +156,7 @@ impl P2pNode {
     ) -> Result<Self>
     where
         A: AllowlistStorage + std::fmt::Debug + 'static,
-        H: iroh::protocol::ProtocolHandler,
+        H: crate::protocol::ProtocolHandler,
     {
         Self::build(
             secret_key_bytes,
@@ -189,7 +190,7 @@ impl P2pNode {
     ) -> Result<Self>
     where
         A: AllowlistStorage + std::fmt::Debug + 'static,
-        H: iroh::protocol::ProtocolHandler,
+        H: crate::protocol::ProtocolHandler,
     {
         Self::build(
             secret_key_bytes,
@@ -217,7 +218,7 @@ impl P2pNode {
     ) -> Result<Self>
     where
         A: AllowlistStorage + std::fmt::Debug + 'static,
-        H: iroh::protocol::ProtocolHandler,
+        H: crate::protocol::ProtocolHandler,
     {
         let signing_key = SigningKey::from_bytes(&secret_key_bytes);
         let secret_key = SecretKey::from_bytes(&signing_key.to_bytes());
@@ -328,9 +329,13 @@ impl P2pNode {
             allowlist,
         };
 
+        // Registration order GOSSIP → SYNC → PAIRING is unchanged. Only the
+        // app-supplied sync handler is wrapped in `IrohHandlerAdapter` (a transparent
+        // pass-through to iroh's trait); the gossip + pairing handlers are p2p-core's
+        // own and stay on iroh's trait directly.
         let router = Router::builder(endpoint.clone())
             .accept(GOSSIP_ALPN, gossip_handler)
-            .accept(sync_alpn, sync_handler)
+            .accept(sync_alpn, IrohHandlerAdapter(sync_handler))
             .accept(PAIRING_ALPN, pairing_handler)
             .spawn();
 

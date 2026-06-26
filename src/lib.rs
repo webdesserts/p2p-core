@@ -24,6 +24,7 @@ pub mod pairing_handler;
 pub mod peer_addr;
 pub mod peer_conn;
 pub mod peer_id;
+pub mod protocol;
 pub mod relay;
 pub mod relay_addr;
 pub mod relay_class;
@@ -55,6 +56,7 @@ pub use pairing_handler::{
 pub use peer_addr::PeerAddr;
 pub use peer_conn::{PeerConnInfo, PeerConnType};
 pub use peer_id::{PeerId, PeerIdError};
+pub use protocol::{AcceptError, Connection, ProtocolHandler};
 pub use relay::EmbeddedRelay;
 pub use relay_addr::{RelayAddr, RelayAddrError};
 pub use relay_class::relay_is_offlan_reachable;
