@@ -196,6 +196,18 @@ impl GossipHandle {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to re-join gossip peers: {e}"))
     }
+
+    /// Broadcast an opaque payload — see [`GossipSubscription::broadcast`].
+    ///
+    /// Pure pass-through to iroh-gossip; no envelope added. sync-core's codec
+    /// wrapper broadcasts through this handle so it does not need to hold the whole
+    /// (non-`Clone`) subscription.
+    pub async fn broadcast(&self, payload: Bytes) -> Result<()> {
+        self.sender
+            .broadcast(payload)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to broadcast gossip payload: {e}"))
+    }
 }
 
 /// Convert `PeerId`s to iroh `EndpointId`s for a gossip re-join, dropping any

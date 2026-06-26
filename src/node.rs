@@ -497,11 +497,14 @@ impl P2pNode {
         self.peer_lookup.remove_endpoint_info(endpoint_id);
     }
 
-    /// Subscribe to gossip for a specific topic.
+    /// Subscribe to a gossip `topic`, bootstrapping toward `bootstrap` peers.
     ///
-    /// `bootstrap_nodes` should be the `EndpointId`s of known peers for that topic.
-    /// At least one bootstrap node is needed to join the gossip swarm. Returns the
-    /// raw iroh-gossip subscribe handle; sync-core wraps it in a `VaultGossip`.
+    /// Returns a generic byte-transport [`GossipSubscription`]: broadcast opaque
+    /// payloads + a stream of generic membership/data events. p2p-core does NOT
+    /// interpret the payload bytes — the app owns its codec (sync-core wraps this
+    /// in a `VaultGossip` that bincode-codecs its `GossipMessage` on top).
+    ///
+    /// At least one bootstrap node is needed to join an existing swarm.
     ///
     /// We pass bare `EndpointId`s and attach NO peer data — yet iroh-gossip still
     /// auto-publishes THIS node's own `EndpointAddr` (relay + direct IPs) as
@@ -515,34 +518,6 @@ impl P2pNode {
     /// The catch (why the persisted `peer_lookup` hints still exist): gossip's book
     /// is soft-state (~300s TTL) and can't cross a full partition or cold-start.
     /// That COLD path is owned by the relay hints + the reconnect supervisor.
-    pub async fn join_topic(
-        &self,
-        topic: TopicId,
-        bootstrap_nodes: Vec<PeerId>,
-    ) -> Result<iroh_gossip::api::GossipTopic> {
-        // Convert to iroh ids at the boundary, dropping any legacy/non-curve-point
-        // id (it could never be a reachable gossip bootstrap target anyway).
-        let bootstrap_ids: Vec<EndpointId> = bootstrap_nodes
-            .into_iter()
-            .filter_map(|p| try_peer_to_endpoint(p).ok())
-            .collect();
-        self.gossip
-            .subscribe(topic, bootstrap_ids)
-            .await
-            .context("Failed to subscribe to gossip topic")
-    }
-
-    /// Subscribe to a gossip `topic`, bootstrapping toward `bootstrap` peers.
-    ///
-    /// Returns a generic byte-transport [`GossipSubscription`]: broadcast opaque
-    /// payloads + a stream of generic membership/data events. p2p-core does NOT
-    /// interpret the payload bytes — the app owns its codec (sync-core wraps this
-    /// in a `VaultGossip` that bincode-codecs its `GossipMessage` on top).
-    ///
-    /// At least one bootstrap node is needed to join an existing swarm. Bare
-    /// `EndpointId`s carry no peer data, yet iroh-gossip still auto-publishes this
-    /// node's own `EndpointAddr` as membership peer-data (the warm address-sharing
-    /// channel) — see [`join_topic`](Self::join_topic) for the full note.
     pub async fn subscribe(
         &self,
         topic: Topic,
