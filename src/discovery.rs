@@ -8,10 +8,11 @@
 //! mDNS is native-only (requires OS-level networking) and is gated by the `native`
 //! feature set.
 
-use iroh::EndpointId;
 use iroh::address_lookup::UserData;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
+
+use crate::peer_id::PeerId;
 
 /// Metadata broadcast via mDNS to identify a mesh (vault).
 ///
@@ -49,7 +50,7 @@ impl EndpointData {
 /// An endpoint's ID paired with its discovery data.
 #[derive(Debug, Clone)]
 pub struct EndpointInfo {
-    pub endpoint_id: EndpointId,
+    pub endpoint_id: PeerId,
     pub data: EndpointData,
 }
 
@@ -59,7 +60,7 @@ pub enum DiscoveryEvent {
     /// A new or updated peer was discovered.
     Discovered { endpoint_info: EndpointInfo },
     /// A previously-discovered peer has expired off the LAN.
-    Expired { endpoint_id: EndpointId },
+    Expired { endpoint_id: PeerId },
 }
 
 /// A discovered mesh on the local network.
@@ -72,8 +73,8 @@ pub struct DiscoveredMesh {
     pub mesh_name: String,
     /// VaultId for grouping (hex string).
     pub vault_id: String,
-    /// Discovered peers in this mesh (their EndpointIds).
-    pub peers: Vec<EndpointId>,
+    /// Discovered peers in this mesh (their `PeerId`s).
+    pub peers: Vec<PeerId>,
     /// Number of online devices (equal to `peers.len()` at discovery time).
     pub online_count: usize,
 }
@@ -118,17 +119,15 @@ pub fn mesh_from_discovery_event(event: &DiscoveryEvent) -> Option<DiscoveredMes
 
 #[cfg(test)]
 mod tests {
-    use iroh::SecretKey;
-
     use super::*;
 
-    /// Generate a deterministic test EndpointId from a seed byte.
-    fn test_endpoint_id(seed: u8) -> EndpointId {
-        SecretKey::from_bytes(&[seed; 32]).public()
+    /// Generate a deterministic test `PeerId` from a seed byte.
+    fn test_peer_id(seed: u8) -> PeerId {
+        PeerId::from_secret_bytes([seed; 32])
     }
 
     /// Build a `DiscoveryEvent::Discovered` with `user_data` set to the given string.
-    fn discovered_event(endpoint_id: EndpointId, user_data_str: &str) -> DiscoveryEvent {
+    fn discovered_event(endpoint_id: PeerId, user_data_str: &str) -> DiscoveryEvent {
         DiscoveryEvent::Discovered {
             endpoint_info: EndpointInfo {
                 endpoint_id,
@@ -139,7 +138,7 @@ mod tests {
 
     #[test]
     fn valid_metadata_returns_single_peer_mesh() {
-        let id = test_endpoint_id(1);
+        let id = test_peer_id(1);
         let meta = MeshMetadata {
             mesh: "Michael's Notes".into(),
             vid: "deadbeef".into(),
@@ -156,7 +155,7 @@ mod tests {
 
     #[test]
     fn malformed_json_returns_none() {
-        let id = test_endpoint_id(2);
+        let id = test_peer_id(2);
         let event = discovered_event(id, "not valid json {{{");
         assert!(mesh_from_discovery_event(&event).is_none());
     }
@@ -164,7 +163,7 @@ mod tests {
     #[test]
     fn missing_required_field_returns_none() {
         // Missing `vid` — serde will fail to deserialize.
-        let id = test_endpoint_id(3);
+        let id = test_peer_id(3);
         let event = discovered_event(id, r#"{"mesh":"My Notes","ver":1}"#);
         assert!(mesh_from_discovery_event(&event).is_none());
     }
@@ -172,7 +171,7 @@ mod tests {
     #[test]
     fn expired_event_returns_none() {
         let event = DiscoveryEvent::Expired {
-            endpoint_id: test_endpoint_id(4),
+            endpoint_id: test_peer_id(4),
         };
         assert!(mesh_from_discovery_event(&event).is_none());
     }
@@ -181,7 +180,7 @@ mod tests {
     fn no_user_data_returns_none() {
         let event = DiscoveryEvent::Discovered {
             endpoint_info: EndpointInfo {
-                endpoint_id: test_endpoint_id(5),
+                endpoint_id: test_peer_id(5),
                 data: EndpointData::new(None),
             },
         };

@@ -83,6 +83,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, trace, warn};
 
 use crate::discovery::{DiscoveryEvent, EndpointData, EndpointInfo};
+use crate::iroh_adapt::{endpoint_to_peer, peer_to_endpoint};
+use crate::peer_id::PeerId;
 
 /// TXT key for the `UserData` JSON blob (matches iroh's wire format).
 const USER_DATA_ATTRIBUTE: &str = "user-data";
@@ -313,12 +315,16 @@ impl MeshMdns {
     /// Returns `Err` if `mdns-sd` fails to start (e.g., no IPv4 interface
     /// available), letting the caller fall through to `mdns: None`.
     pub fn new(
-        endpoint_id: EndpointId,
+        node_id: PeerId,
         service_name: &str,
         port: u16,
         addrs: Vec<IpAddr>,
         rt: &Handle,
     ) -> Result<Self, mdns_sd::Error> {
+        // This node's own id is transport-sourced (it came from our endpoint), so
+        // it is always a valid key. The rest of the actor speaks iroh's
+        // `EndpointId` internally.
+        let endpoint_id = peer_to_endpoint(node_id);
         let daemon = ServiceDaemon::new_with_port(MESH_MDNS_PORT)?;
 
         // Disable IPv6 to prevent EHOSTUNREACH storms from utun-injected
@@ -519,7 +525,9 @@ impl MeshMdns {
                                         }
                                         trace!(%endpoint_id, "mDNS: service removed");
                                         peers.remove(&endpoint_id);
-                                        subscribers.send(DiscoveryEvent::Expired { endpoint_id });
+                                        subscribers.send(DiscoveryEvent::Expired {
+                                            endpoint_id: endpoint_to_peer(endpoint_id),
+                                        });
                                     }
                                     Err(_) => {
                                         debug!(
@@ -805,11 +813,8 @@ impl MeshMdns {
     /// tests. Use `seed_peer_for_test()` and `requery_is_active()` to drive tests
     /// without touching the real mDNS stack.
     #[cfg(test)]
-    pub(crate) fn new_for_test(
-        endpoint_id: EndpointId,
-        rt: &Handle,
-    ) -> Result<Self, mdns_sd::Error> {
-        Self::new(endpoint_id, "obsidian-sync-test", 0, vec![], rt)
+    pub(crate) fn new_for_test(node_id: PeerId, rt: &Handle) -> Result<Self, mdns_sd::Error> {
+        Self::new(node_id, "obsidian-sync-test", 0, vec![], rt)
     }
 
     /// Seed a peer directly into the actor's peer map, bypassing mDNS.
@@ -817,9 +822,11 @@ impl MeshMdns {
     /// Only available in `#[cfg(test)]`. If any subscribers are active when
     /// this is called, they will receive a `Discovered` event for the peer.
     #[cfg(test)]
-    async fn seed_peer_for_test(&self, endpoint_id: EndpointId, snapshot: PeerSnapshot) {
+    async fn seed_peer_for_test(&self, peer: PeerId, snapshot: PeerSnapshot) {
+        // The actor map is keyed by iroh's `EndpointId`; convert at this internal
+        // test seam (the public discovery events still surface `PeerId`).
         self.sender
-            .send(Message::SeedPeerForTest(endpoint_id, snapshot))
+            .send(Message::SeedPeerForTest(peer_to_endpoint(peer), snapshot))
             .await
             .ok();
     }
@@ -1057,7 +1064,9 @@ fn discovered_event_from_snapshot(
         .and_then(|s| s.parse::<UserData>().ok());
     DiscoveryEvent::Discovered {
         endpoint_info: EndpointInfo {
-            endpoint_id,
+            // Convert the actor's internal iroh id to a `PeerId` at the public
+            // event boundary.
+            endpoint_id: endpoint_to_peer(endpoint_id),
             data: EndpointData::new(user_data),
         },
     }
@@ -1179,19 +1188,16 @@ mod tests {
     use std::time::Duration;
     use tokio::runtime::Handle;
 
-    use iroh::{EndpointId, SecretKey};
-
     use super::{
-        DiscoveryEvent, FAST_PHASE_DURATION, FAST_REQUERY_INTERVAL, MeshMdns, PeerSnapshot,
+        DiscoveryEvent, FAST_PHASE_DURATION, FAST_REQUERY_INTERVAL, MeshMdns, PeerId, PeerSnapshot,
         SLOW_REQUERY_INTERVAL, strip_conflict_suffix,
     };
 
-    // Helper: generate a deterministic test EndpointId from a seed byte.
-    // SecretKey::from_bytes accepts any 32 bytes; the resulting public key is
-    // the EndpointId.
-    fn test_endpoint_id(seed: u8) -> EndpointId {
-        let bytes = [seed; 32];
-        SecretKey::from_bytes(&bytes).public()
+    // Helper: generate a deterministic test `PeerId` from a seed byte.
+    // `from_secret_bytes` derives the ed25519 public key, so the resulting id is a
+    // valid curve point (the same identity the discovery events surface).
+    fn test_peer_id(seed: u8) -> PeerId {
+        PeerId::from_secret_bytes([seed; 32])
     }
 
     // Helper: a snapshot with user_data set.
@@ -1247,11 +1253,11 @@ mod tests {
     #[tokio::test]
     async fn subscribe_replays_known_peers() {
         let rt = Handle::current();
-        let own_id = test_endpoint_id(0xAA);
+        let own_id = test_peer_id(0xAA);
         let mdns = MeshMdns::new_for_test(own_id, &rt).expect("daemon started");
 
-        let peer_with_data = test_endpoint_id(0x01);
-        let peer_without_data = test_endpoint_id(0x02);
+        let peer_with_data = test_peer_id(0x01);
+        let peer_without_data = test_peer_id(0x02);
         let user_data_str = r#"{"mesh":"Test Vault","vid":"0000000000000000","ver":1}"#;
 
         // Seed two peers into the actor before subscribing.
@@ -1304,11 +1310,11 @@ mod tests {
     #[tokio::test]
     async fn subscribe_replay_then_live_event_ordering() {
         let rt = Handle::current();
-        let own_id = test_endpoint_id(0xBB);
+        let own_id = test_peer_id(0xBB);
         let mdns = MeshMdns::new_for_test(own_id, &rt).expect("daemon started");
 
-        let seeded_peer = test_endpoint_id(0x10);
-        let live_peer = test_endpoint_id(0x11);
+        let seeded_peer = test_peer_id(0x10);
+        let live_peer = test_peer_id(0x11);
         let user_data_str = r#"{"mesh":"Order Test","vid":"1111111111111111","ver":1}"#;
 
         // Seed one peer before subscribing.
@@ -1362,7 +1368,7 @@ mod tests {
     #[tokio::test]
     async fn requery_starts_on_first_subscribe_and_stops_on_last_unsubscribe() {
         let rt = Handle::current();
-        let own_id = test_endpoint_id(0xCC);
+        let own_id = test_peer_id(0xCC);
         let mdns = MeshMdns::new_for_test(own_id, &rt).expect("daemon started");
 
         // Initially inactive — no subscribers yet.
@@ -1387,7 +1393,7 @@ mod tests {
         drop(stream1);
 
         // Trigger the actor to process a message so it runs the prune check.
-        let trigger_peer = test_endpoint_id(0x20);
+        let trigger_peer = test_peer_id(0x20);
         mdns.seed_peer_for_test(trigger_peer, snapshot_without_data())
             .await;
         wait_for(
@@ -1424,7 +1430,7 @@ mod tests {
     #[tokio::test]
     async fn bridge_survives_multiple_requery_cycles() {
         let rt = Handle::current();
-        let own_id = test_endpoint_id(0xDD);
+        let own_id = test_peer_id(0xDD);
         let mdns = MeshMdns::new_for_test(own_id, &rt).expect("daemon started");
 
         // Subscribe so there is a live subscriber to receive events.
@@ -1440,7 +1446,7 @@ mod tests {
         // receives the SeedPeerForTest message (the actor itself is fine) but the
         // bridge never delivers any further Message::Peer events — which means the
         // subscriber never sees this Discovered event.
-        let post_requery_peer = test_endpoint_id(0x30);
+        let post_requery_peer = test_peer_id(0x30);
         mdns.seed_peer_for_test(post_requery_peer, snapshot_without_data())
             .await;
 
@@ -1490,7 +1496,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn fast_burst_followed_by_slow_phase() {
         let rt = Handle::current();
-        let own_id = test_endpoint_id(0xE0);
+        let own_id = test_peer_id(0xE0);
         let mdns = MeshMdns::new_for_test(own_id, &rt).expect("daemon started");
 
         let _stream = mdns.subscribe().await;
@@ -1513,7 +1519,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn requery_decays_to_slow_phase_after_fast_burst() {
         let rt = Handle::current();
-        let own_id = test_endpoint_id(0xE1);
+        let own_id = test_peer_id(0xE1);
         let mdns = MeshMdns::new_for_test(own_id, &rt).expect("daemon started");
 
         let _stream = mdns.subscribe().await;
@@ -1546,7 +1552,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn new_subscribe_during_slow_phase_resets_to_fast() {
         let rt = Handle::current();
-        let own_id = test_endpoint_id(0xE2);
+        let own_id = test_peer_id(0xE2);
         let mdns = MeshMdns::new_for_test(own_id, &rt).expect("daemon started");
 
         let _stream1 = mdns.subscribe().await;

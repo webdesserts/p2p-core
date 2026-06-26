@@ -15,6 +15,7 @@ pub mod config;
 pub mod daemon_lock;
 pub mod discovery;
 pub mod identity;
+mod iroh_adapt;
 pub mod key_storage;
 pub mod mesh_mdns;
 pub mod node;

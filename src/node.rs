@@ -23,9 +23,11 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::allowlist::AllowlistStorage;
+use crate::iroh_adapt::{endpoint_to_peer, try_peer_to_endpoint};
 use crate::mesh_mdns::MeshMdns;
 use crate::pairing_handler::{PAIRING_ALPN, PairingEvent, PairingStreamHandler};
 use crate::peer_conn::{PeerConnInfo, PeerConnType, classify_remote_info};
+use crate::peer_id::PeerId;
 use crate::relay_addr::RelayAddr;
 
 /// The mDNS service name for obsidian-sync mesh discovery.
@@ -74,8 +76,6 @@ impl<A: AllowlistStorage + std::fmt::Debug + 'static> iroh::protocol::ProtocolHa
         &self,
         connection: iroh::endpoint::Connection,
     ) -> Result<(), iroh::protocol::AcceptError> {
-        use crate::peer_id::PeerId;
-
         let remote_id = connection.remote_id();
         let peer_id = PeerId::from_bytes(*remote_id.as_bytes());
 
@@ -271,7 +271,13 @@ impl P2pNode {
             // Only advertise IPv4 sockets (V4Only mDNS scope).
             let v4_ips: Vec<std::net::IpAddr> = ips.into_iter().filter(|ip| ip.is_ipv4()).collect();
             let rt = tokio::runtime::Handle::current();
-            match MeshMdns::new(endpoint.id(), MDNS_SERVICE_NAME, port, v4_ips, &rt) {
+            match MeshMdns::new(
+                endpoint_to_peer(endpoint.id()),
+                MDNS_SERVICE_NAME,
+                port,
+                v4_ips,
+                &rt,
+            ) {
                 Ok(mdns) => {
                     match endpoint.address_lookup() {
                         Ok(lookup) => {
@@ -338,9 +344,9 @@ impl P2pNode {
         })
     }
 
-    /// This node's iroh EndpointId (matches our ed25519 public key).
-    pub fn node_id(&self) -> EndpointId {
-        self.endpoint.id()
+    /// This node's [`PeerId`] (matches our ed25519 public key).
+    pub fn node_id(&self) -> PeerId {
+        endpoint_to_peer(self.endpoint.id())
     }
 
     /// Snapshot how we are currently reaching `peer`.
@@ -350,8 +356,17 @@ impl P2pNode {
     /// snapshot — it may report `Unknown` in the instant a peer first connects
     /// (before holepunching settles) and self-corrects on later queries. The
     /// daemon composes the friendly device name on top of this.
-    pub async fn peer_conn_info(&self, peer: EndpointId) -> PeerConnInfo {
-        let conn_type = match self.endpoint.remote_info(peer).await {
+    ///
+    /// A legacy/non-curve-point `PeerId` (one that did not come from a real key)
+    /// has no transport identity, so it degrades to an `Unknown` path rather than
+    /// panicking — the daemon's connect-logging relies on this graceful fallback.
+    pub async fn peer_conn_info(&self, peer: PeerId) -> PeerConnInfo {
+        let Ok(endpoint_id) = try_peer_to_endpoint(peer) else {
+            return PeerConnInfo {
+                conn_type: PeerConnType::Unknown,
+            };
+        };
+        let conn_type = match self.endpoint.remote_info(endpoint_id).await {
             Some(info) => classify_remote_info(&info),
             None => PeerConnType::Unknown,
         };
@@ -368,14 +383,18 @@ impl P2pNode {
     /// If the relay is unreachable off-LAN, connection attempts through that hint
     /// will simply fail; there is no automatic fallback to mDNS off-LAN because
     /// mDNS does not operate across network boundaries.
-    pub fn add_peer_relay(&self, endpoint_id: EndpointId, relay_url: &RelayAddr) {
-        if endpoint_id == self.node_id() {
+    pub fn add_peer_relay(&self, peer: PeerId, relay_url: &RelayAddr) {
+        if peer == self.node_id() {
             tracing::warn!(
-                "add_peer_relay called with our own EndpointId — ignoring to prevent \
+                "add_peer_relay called with our own PeerId — ignoring to prevent \
                  self-connect (iroh rejects self-directed relay paths)"
             );
             return;
         }
+        let Ok(endpoint_id) = try_peer_to_endpoint(peer) else {
+            tracing::warn!(%peer, "add_peer_relay skipped — peer id is not a valid key");
+            return;
+        };
         let addr = EndpointAddr::new(endpoint_id).with_relay_url(relay_url.as_iroh().clone());
         self.peer_lookup.add_endpoint_info(addr);
     }
@@ -411,14 +430,18 @@ impl P2pNode {
     /// before re-bootstrapping, and learn-on-exchange replaces a moved peer's relay.
     /// A union would let a stale, dead relay URL linger alongside the fresh one and
     /// keep getting dialed; the overwrite guarantees only the latest hint remains.
-    pub fn set_peer_relay(&self, endpoint_id: EndpointId, relay_url: &RelayAddr) {
-        if endpoint_id == self.node_id() {
+    pub fn set_peer_relay(&self, peer: PeerId, relay_url: &RelayAddr) {
+        if peer == self.node_id() {
             tracing::warn!(
-                "set_peer_relay called with our own EndpointId — ignoring to prevent \
+                "set_peer_relay called with our own PeerId — ignoring to prevent \
                  self-connect (iroh rejects self-directed relay paths)"
             );
             return;
         }
+        let Ok(endpoint_id) = try_peer_to_endpoint(peer) else {
+            tracing::warn!(%peer, "set_peer_relay skipped — peer id is not a valid key");
+            return;
+        };
         let addr = EndpointAddr::new(endpoint_id).with_relay_url(relay_url.as_iroh().clone());
         self.peer_lookup.set_endpoint_info(addr);
     }
@@ -440,14 +463,19 @@ impl P2pNode {
     /// re-adds it via `set_peer_relay` on a slow cadence so a genuinely off-LAN
     /// peer that returns is still reached. Removing an absent key is a harmless
     /// no-op.
-    pub fn remove_peer_relay(&self, endpoint_id: EndpointId) {
-        if endpoint_id == self.node_id() {
+    pub fn remove_peer_relay(&self, peer: PeerId) {
+        if peer == self.node_id() {
             tracing::warn!(
-                "remove_peer_relay called with our own EndpointId — ignoring for \
+                "remove_peer_relay called with our own PeerId — ignoring for \
                  consistency with add/set_peer_relay (we never seed ourselves)"
             );
             return;
         }
+        // A legacy/non-curve-point id was never seeded, so there is nothing to
+        // remove — a no-op skip, matching the "removing an absent key" contract.
+        let Ok(endpoint_id) = try_peer_to_endpoint(peer) else {
+            return;
+        };
         self.peer_lookup.remove_endpoint_info(endpoint_id);
     }
 
@@ -472,10 +500,16 @@ impl P2pNode {
     pub async fn join_topic(
         &self,
         topic: TopicId,
-        bootstrap_nodes: Vec<EndpointId>,
+        bootstrap_nodes: Vec<PeerId>,
     ) -> Result<iroh_gossip::api::GossipTopic> {
+        // Convert to iroh ids at the boundary, dropping any legacy/non-curve-point
+        // id (it could never be a reachable gossip bootstrap target anyway).
+        let bootstrap_ids: Vec<EndpointId> = bootstrap_nodes
+            .into_iter()
+            .filter_map(|p| try_peer_to_endpoint(p).ok())
+            .collect();
         self.gossip
-            .subscribe(topic, bootstrap_nodes)
+            .subscribe(topic, bootstrap_ids)
             .await
             .context("Failed to subscribe to gossip topic")
     }
