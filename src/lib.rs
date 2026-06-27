@@ -69,3 +69,14 @@ pub use relay_class::relay_is_offlan_reachable;
 /// supervisor) can open gossip-bound connections without taking a direct
 /// dependency on `iroh-gossip`.
 pub use iroh_gossip::net::GOSSIP_ALPN;
+
+/// Iroh value types re-exported for downstream TEST HARNESSES ONLY (gated behind
+/// `test-util`). These let sync-core / sync-daemon integration tests name iroh's
+/// transport types WITHOUT a direct `iroh` dev-dependency — re-export the dep, the
+/// type stays iroh's, scoped to test builds so production never sees this surface.
+/// NOT part of p2p-core's production API. (The `relay_probe` diagnostic uses raw
+/// `iroh::*` directly — it lives in p2p-core's examples/, not here.)
+#[cfg(feature = "test-util")]
+pub use iroh::{
+    EndpointAddr, EndpointId, RelayUrl, SecretKey, Watcher, address_lookup::memory::MemoryLookup,
+};

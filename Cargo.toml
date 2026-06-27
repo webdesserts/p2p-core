@@ -71,5 +71,15 @@ toml.workspace = true
 fs2 = "0.4"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }
+# `rt-multi-thread` + `time` are for the relocated `relay_probe` example's bare
+# `#[tokio::main]` + `tokio::spawn` + `tokio::time` (it formerly compiled under
+# sync-core's wider dev graph; p2p-core's narrower graph needs them explicit).
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
 tempfile.workspace = true
+# `relay_probe` surfaces iroh's relay-client logs via `RUST_LOG` (EnvFilter).
+tracing-subscriber.workspace = true
+
+# Diagnostic: probe whether two relay-only iroh nodes can connect through a given
+# relay. Uses raw `iroh::*` (p2p-core owns iroh), so no `required-features`.
+[[example]]
+name = "relay_probe"
