@@ -263,7 +263,16 @@ impl P2pNode {
         // connectivity bug — that re-adds the n0 dependency we intentionally cut.
         let builder = Endpoint::builder(presets::Minimal)
             .secret_key(secret_key)
-            .relay_mode(relay_mode);
+            .relay_mode(relay_mode)
+            // Trust the OS/system CA store (macOS Keychain, incl. MDM-installed CAs)
+            // instead of iroh's bundled webpki roots. Corporate TLS-intercepting
+            // proxies re-sign with a CA the OS already trusts via MDM, so this lets
+            // the relay client connect through them as well as off-network. The
+            // relay's outer TLS is just transport — actual sync traffic is
+            // independently end-to-end encrypted via QUIC/TLS1.3 keyed to node
+            // identities, so this only affects what a relay-hop MITM can see (peer
+            // public keys, connection timing), never note content.
+            .ca_roots_config(iroh::tls::CaRootsConfig::system());
         // Relay-only: drop every IP transport so no direct/loopback path exists —
         // the endpoint must route through a relay (the off-LAN/NAT condition).
         let builder = if relay_only {

@@ -31,7 +31,11 @@ const STEP_TIMEOUT: Duration = Duration::from_secs(25);
 async fn build_relay_only(relay: &RelayUrl, alpns: Vec<Vec<u8>>) -> Result<Endpoint> {
     let mut builder = Endpoint::builder(presets::Minimal)
         .relay_mode(RelayMode::Custom(RelayMap::from_iter([relay.clone()])))
-        .clear_ip_transports();
+        .clear_ip_transports()
+        // Trust the OS/system CA store, matching the node's production endpoint —
+        // keeps this diagnostic tool working through the same corporate TLS-
+        // intercepting proxies it's meant to diagnose against (e.g. umbra.computer).
+        .ca_roots_config(iroh::tls::CaRootsConfig::system());
     if !alpns.is_empty() {
         builder = builder.alpns(alpns);
     }
@@ -46,7 +50,9 @@ async fn build_relay_only(relay: &RelayUrl, alpns: Vec<Vec<u8>>) -> Result<Endpo
 /// paths still registers with its home relay (umbra's daemon topology).
 async fn build_with_ip(relay: &RelayUrl, alpns: Vec<Vec<u8>>) -> Result<Endpoint> {
     let mut builder = Endpoint::builder(presets::Minimal)
-        .relay_mode(RelayMode::Custom(RelayMap::from_iter([relay.clone()])));
+        .relay_mode(RelayMode::Custom(RelayMap::from_iter([relay.clone()])))
+        // See build_relay_only: trust the OS/system CA store, matching production.
+        .ca_roots_config(iroh::tls::CaRootsConfig::system());
     if !alpns.is_empty() {
         builder = builder.alpns(alpns);
     }
