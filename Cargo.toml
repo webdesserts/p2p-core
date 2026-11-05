@@ -1,8 +1,11 @@
 [package]
 name = "p2p-core"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2024"
+authors = ["Michael Mullins"]
+license = "Apache-2.0"
+repository = "https://github.com/webdesserts/p2p-core"
+description = "iroh-based peer-to-peer networking: identity, pairing, mDNS discovery, relay and gossip"
 
 [features]
 # Test-only surface: exposes constructors that simulate constrained network
@@ -13,19 +16,19 @@ license.workspace = true
 test-util = []
 
 [dependencies]
-ed25519-dalek.workspace = true
-getrandom.workspace = true
-async-trait.workspace = true
-serde.workspace = true
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+getrandom = { version = "0.2", features = ["js"] }
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
 # `mesh_from_discovery_event` (discovery) + `publish_mesh_info` (node) serialize
 # `MeshMetadata` to/from JSON in production code, so `serde_json` is a hard dep.
-serde_json.workspace = true
-thiserror.workspace = true
-tracing.workspace = true
-anyhow.workspace = true
+serde_json = "1.0"
+thiserror = "2"
+tracing = "0.1"
+anyhow = "1.0"
 # `AllowedPeer`/`PairingSession` timestamps use `web_time` for a portable
 # SystemTime/Instant.
-web-time.workspace = true
+web-time = "1"
 # Pairing HMAC-SHA256 (the only consumer of these in the crate).
 sha2 = "0.10"
 hmac = "0.12"
@@ -54,31 +57,30 @@ tokio-stream = "0.1"
 # Cross-platform async task spawning + boxed streams used by the mDNS actor.
 n0-future = "0.3"
 # `FutureExt::flatten_stream` in the mDNS `AddressLookup::resolve` impl.
-futures.workspace = true
+futures = "0.3"
 # The pairing QUIC handler serializes its wire messages with bincode in
 # production code, and the pairing round-trip tests assert byte-stability.
-bincode.workspace = true
+bincode = "1.3"
 # `bytes::Bytes` is iroh-gossip's payload type; the gossip transport's
 # `broadcast(Bytes)` / `GossipEvent::Data { bytes }` speak it directly.
 bytes = "1"
 # The workspace `tokio` is `features = ["full"]`, which already includes `fs`
 # (used by `FileKeyStorage`), `rt`, `macros`, and `time` (mDNS requery timers).
 # No per-crate feature subset needed.
-tokio.workspace = true
+tokio = { version = "1", features = ["full"] }
 # `DaemonConfig` serde-serializes to/from `.sync/daemon.toml`.
-toml.workspace = true
+toml = "0.8"
 # `DaemonLock`'s flock-based single-instance guard on `.sync/daemon.lock`.
-# Not a workspace dep — pinned directly, matching sync-daemon's declaration.
 fs2 = "0.4"
 
 [dev-dependencies]
 # `rt-multi-thread` + `time` are for the relocated `relay_probe` example's bare
 # `#[tokio::main]` + `tokio::spawn` + `tokio::time` (its previous home had a
 # wider dev graph; p2p-core's narrower graph needs them explicit).
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
-tempfile.workspace = true
+tokio = { version = "1", features = ["full"] }
+tempfile = "3"
 # `relay_probe` surfaces iroh's relay-client logs via `RUST_LOG` (EnvFilter).
-tracing-subscriber.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Diagnostic: probe whether two relay-only iroh nodes can connect through a given
 # relay. Uses raw `iroh::*` (p2p-core owns iroh), so no `required-features`.
