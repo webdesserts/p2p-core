@@ -46,7 +46,9 @@ pub use gossip::{GossipEvent, GossipHandle, GossipSubscription, Topic};
 pub use identity::{FileKeyStorage, IdentityKey};
 pub use key_storage::{KeyStorage, KeyStorageError};
 pub use mesh_mdns::{MeshMdns, socket_addrs_to_port_addrs};
-pub use node::{DialHandle, P2pNode, topic_from_u64, u64_from_topic};
+pub use node::{
+    DEFAULT_MDNS_SERVICE_NAME, DialHandle, P2pNode, P2pNodeBuilder, topic_from_u64, u64_from_topic,
+};
 pub use pairing::{
     PairingChallenge, PairingHello, PairingResponse, PairingResult, PairingSession, compute_hmac,
     generate_pairing_code, verify_hmac,

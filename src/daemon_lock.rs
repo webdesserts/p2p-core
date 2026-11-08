@@ -35,7 +35,13 @@ impl DaemonLock {
     /// Creates `.sync/` if it doesn't exist. Returns `LockError::AlreadyLocked`
     /// if another process holds the lock.
     pub fn acquire(vault_path: &Path) -> Result<Self, LockError> {
-        let path = vault_path.join(LOCK_FILE);
+        Self::acquire_at(&vault_path.join(LOCK_FILE))
+    }
+
+    /// Try to acquire an exclusive flock on the exact file `lock_path`
+    /// (e.g. `~/.config/webdesserts/mesh/mesh.lock`).
+    pub fn acquire_at(lock_path: &Path) -> Result<Self, LockError> {
+        let path = lock_path.to_path_buf();
 
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -73,6 +79,20 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    /// `acquire_at` must lock an arbitrary path and release cleanly on drop.
+    #[tokio::test]
+    async fn acquire_at_locks_custom_path() {
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join("mesh/mesh.lock");
+        let first = DaemonLock::acquire_at(&lock_path).unwrap();
+        assert!(matches!(
+            DaemonLock::acquire_at(&lock_path),
+            Err(LockError::AlreadyLocked)
+        ));
+        drop(first);
+        assert!(DaemonLock::acquire_at(&lock_path).is_ok());
+    }
 
     fn setup_vault() -> TempDir {
         let dir = TempDir::new().unwrap();

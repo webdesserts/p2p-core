@@ -295,6 +295,12 @@ impl FileAllowlistStorage {
             path: vault_path.join(".sync/allowlist.json"),
         }
     }
+
+    /// Create storage pointing at the exact file `path`
+    /// (e.g. `~/.config/webdesserts/mesh/allowlist.json`).
+    pub fn at_path(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
 }
 
 #[async_trait]
@@ -318,7 +324,10 @@ impl AllowlistStorage for FileAllowlistStorage {
         let contents =
             serde_json::to_string_pretty(peers).map_err(|_| AllowlistError::InvalidData)?;
 
-        fs::write(&self.path, contents).map_err(|e| AllowlistError::Io(e.to_string()))
+        // Atomic write: readers never observe a half-written roster.
+        let tmp_path = self.path.with_extension("json.tmp");
+        fs::write(&tmp_path, contents).map_err(|e| AllowlistError::Io(e.to_string()))?;
+        fs::rename(&tmp_path, &self.path).map_err(|e| AllowlistError::Io(e.to_string()))
     }
 }
 
@@ -359,6 +368,22 @@ pub async fn write_pair_allowlist<AL: AllowlistStorage>(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// `FileAllowlistStorage::at_path` must persist atomically at the exact path.
+    #[tokio::test]
+    async fn file_allowlist_at_path_uses_exact_path() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("mesh/allowlist.json");
+        let storage = FileAllowlistStorage::at_path(path.as_path());
+        let peer = peer_a();
+        storage.add_peer(peer, "test").await.unwrap();
+        assert!(path.exists());
+        assert!(!dir.path().join(".sync").exists());
+        assert!(!path.with_extension("json.tmp").exists());
+
+        let reloaded = FileAllowlistStorage::at_path(path.as_path());
+        assert!(reloaded.is_allowed(&peer).await.unwrap());
+    }
 
     fn peer_a() -> PeerId {
         PeerId::generate()

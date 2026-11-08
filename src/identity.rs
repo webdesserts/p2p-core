@@ -34,6 +34,14 @@ impl FileKeyStorage {
             path: vault_path.join(KEY_FILE),
         }
     }
+
+    /// Create a `FileKeyStorage` reading/writing the exact file at `key_path`
+    /// (e.g. `~/.config/webdesserts/mesh/secret.key`), without appending `.sync/daemon.key`.
+    pub fn at_path(key_path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: key_path.into(),
+        }
+    }
 }
 
 #[async_trait]
@@ -101,6 +109,18 @@ impl IdentityKey {
         Ok(key)
     }
 
+    /// Load or generate an identity key at the exact file path `key_path` (`0600` on Unix).
+    pub async fn load_or_generate_at(key_path: &Path) -> Result<Self> {
+        let storage = FileKeyStorage::at_path(key_path);
+        let bytes = storage
+            .load_or_generate()
+            .await
+            .map_err(|e| anyhow::anyhow!("Key storage error: {}", e))?;
+        let key = Self::from_bytes(bytes);
+        info!(peer_id = %key.peer_id(), path = %key_path.display(), "Loaded or generated identity key");
+        Ok(key)
+    }
+
     /// Load an identity key from a custom key file path.
     ///
     /// The file must contain exactly 32 bytes (the ed25519 secret key).
@@ -141,6 +161,24 @@ impl IdentityKey {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// `load_or_generate_at` must use the exact path and never create `.sync/`.
+    #[tokio::test]
+    async fn load_or_generate_at_uses_exact_path_without_dot_sync() {
+        let dir = TempDir::new().unwrap();
+        let key_path = dir.path().join("mesh/secret.key");
+        let key = IdentityKey::load_or_generate_at(&key_path).await.unwrap();
+        assert!(key_path.exists());
+        assert!(!dir.path().join(".sync").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let reloaded = IdentityKey::load_or_generate_at(&key_path).await.unwrap();
+        assert_eq!(key.peer_id(), reloaded.peer_id());
+    }
 
     // ==================== FileKeyStorage tests ====================
 

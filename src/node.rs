@@ -41,7 +41,13 @@ use crate::relay_addr::RelayAddr;
 ///
 /// Peers using the same service name can discover each other on the LAN.
 /// Peers on a different service name are invisible to each other.
-const MDNS_SERVICE_NAME: &str = "obsidian-sync";
+/// Default mDNS service name for `NotesSync` (`obsidian-sync`, 13 bytes) mesh discovery.
+///
+/// Standalone consumers such as `Mesh.app` override this via
+/// [`P2pNodeBuilder::mdns_service_name`] (e.g. `"wd-mesh"`, <= 15 bytes per
+/// RFC 6763 / `mdns-sd`'s `SERVICE_NAME_LEN_MAX_DEFAULT`) so side-by-side
+/// daemons on the same LAN never cross-contaminate discovery streams.
+pub const DEFAULT_MDNS_SERVICE_NAME: &str = "obsidian-sync";
 
 /// Derive a deterministic gossip [`TopicId`] from a `u64` seed.
 ///
@@ -117,6 +123,187 @@ impl<A: AllowlistStorage + std::fmt::Debug + 'static> iroh::protocol::ProtocolHa
     }
 }
 
+/// Wraps an application [`crate::protocol::ProtocolHandler`] with Layer-2
+/// allowlist + tombstone revocation enforcement at the QUIC `accept` boundary.
+///
+/// Non-allowlisted or revoked (`removed: true`) peers are rejected immediately
+/// with close code `1` (`"not in allowlist"`) before the inner handler runs.
+#[derive(Debug)]
+struct AllowlistProtocolHandler<A, H> {
+    allowlist: Arc<A>,
+    alpn: &'static [u8],
+    inner: H,
+}
+
+impl<A, H> crate::protocol::ProtocolHandler for AllowlistProtocolHandler<A, H>
+where
+    A: AllowlistStorage + std::fmt::Debug + 'static,
+    H: crate::protocol::ProtocolHandler,
+{
+    async fn accept(
+        &self,
+        connection: iroh::endpoint::Connection,
+    ) -> std::result::Result<(), crate::protocol::AcceptError> {
+        let remote_id = connection.remote_id();
+        let peer_id = PeerId::from_bytes(*remote_id.as_bytes());
+
+        if !gossip_peer_allowed(self.allowlist.as_ref(), &peer_id).await {
+            warn!(
+                peer = %remote_id,
+                alpn = %String::from_utf8_lossy(self.alpn),
+                "Protocol connection rejected — peer not in allowlist"
+            );
+            connection.close(iroh::endpoint::VarInt::from_u32(1), b"not in allowlist");
+            return Ok(());
+        }
+
+        self.inner.accept(connection).await
+    }
+}
+
+/// Builder for configuring a [`P2pNode`] with one or more custom ALPN protocols
+/// alongside the built-in gossip (`GOSSIP_ALPN`) and pairing (`PAIRING_ALPN`) handlers.
+pub struct P2pNodeBuilder<'a, A> {
+    secret_key_bytes: [u8; 32],
+    relays: &'a [RelayAddr],
+    allowlist: Arc<A>,
+    relay_only: bool,
+    mdns_service_name: &'static str,
+    protocols: Vec<(&'static [u8], Box<dyn iroh::protocol::DynProtocolHandler>)>,
+}
+
+impl<A> std::fmt::Debug for P2pNodeBuilder<'_, A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("P2pNodeBuilder")
+            .field("relay_only", &self.relay_only)
+            .field("mdns_service_name", &self.mdns_service_name)
+            .field("protocols", &self.protocols.len())
+            .finish()
+    }
+}
+
+impl<'a, A> P2pNodeBuilder<'a, A>
+where
+    A: AllowlistStorage + std::fmt::Debug + 'static,
+{
+    /// Register a custom ALPN handler **without** an outer allowlist gate.
+    ///
+    /// The handler itself must enforce any peer authorization (as `NotesSync`'s
+    /// sync handler does). `Mesh.app` protocols should use
+    /// [`Self::with_allowlisted_protocol`] instead.
+    pub fn with_protocol<H: crate::protocol::ProtocolHandler>(
+        mut self,
+        alpn: &'static [u8],
+        handler: H,
+    ) -> Self {
+        self.protocols
+            .push((alpn, Box::new(IrohHandlerAdapter(handler))));
+        self
+    }
+
+    /// Register a custom ALPN handler wrapped in the Layer-2 allowlist +
+    /// tombstone revocation gate.
+    pub fn with_allowlisted_protocol<H: crate::protocol::ProtocolHandler>(
+        mut self,
+        alpn: &'static [u8],
+        handler: H,
+    ) -> Self {
+        let wrapped = AllowlistProtocolHandler {
+            allowlist: Arc::clone(&self.allowlist),
+            alpn,
+            inner: handler,
+        };
+        self.protocols
+            .push((alpn, Box::new(IrohHandlerAdapter(wrapped))));
+        self
+    }
+
+    /// Override the mDNS service name (defaults to [`DEFAULT_MDNS_SERVICE_NAME`]).
+    pub fn mdns_service_name(mut self, service_name: &'static str) -> Self {
+        self.mdns_service_name = service_name;
+        self
+    }
+
+    /// Strip IP transports from the endpoint so the only routing path is a relay.
+    #[cfg(feature = "test-util")]
+    pub fn relay_only(mut self, relay_only: bool) -> Self {
+        self.relay_only = relay_only;
+        self
+    }
+
+    /// Validate configuration, bind the endpoint, and spawn the router.
+    pub async fn build(self) -> Result<P2pNode> {
+        // Fail-fast mDNS service name validation BEFORE binding the endpoint.
+        if self.mdns_service_name.is_empty() || self.mdns_service_name.len() > 15 {
+            anyhow::bail!(
+                "mDNS service name {:?} must be 1..=15 bytes (got {} bytes)",
+                self.mdns_service_name,
+                self.mdns_service_name.len()
+            );
+        }
+        if !self
+            .mdns_service_name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            anyhow::bail!(
+                "mDNS service name {:?} may only contain [a-z0-9-]",
+                self.mdns_service_name
+            );
+        }
+
+        // Fail-fast ALPN validation BEFORE binding the endpoint.
+        for (i, (alpn, _)) in self.protocols.iter().enumerate() {
+            if alpn.is_empty() {
+                anyhow::bail!("ALPN must not be empty");
+            }
+            if *alpn == GOSSIP_ALPN || *alpn == PAIRING_ALPN {
+                anyhow::bail!(
+                    "ALPN {:?} is reserved by p2p-core",
+                    String::from_utf8_lossy(alpn)
+                );
+            }
+            if self.protocols[..i].iter().any(|(prev, _)| prev == alpn) {
+                anyhow::bail!(
+                    "duplicate ALPN registration: {:?}",
+                    String::from_utf8_lossy(alpn)
+                );
+            }
+        }
+
+        P2pNode::build(
+            self.secret_key_bytes,
+            self.relays,
+            self.allowlist,
+            self.relay_only,
+            self.mdns_service_name,
+            self.protocols,
+        )
+        .await
+    }
+}
+
+impl P2pNode {
+    /// Start building a [`P2pNode`] with zero or more custom ALPN handlers.
+    pub fn builder<A>(
+        secret_key_bytes: [u8; 32],
+        relays: &[RelayAddr],
+        allowlist: Arc<A>,
+    ) -> P2pNodeBuilder<'_, A>
+    where
+        A: AllowlistStorage + std::fmt::Debug + 'static,
+    {
+        P2pNodeBuilder {
+            secret_key_bytes,
+            relays,
+            allowlist,
+            relay_only: false,
+            mdns_service_name: DEFAULT_MDNS_SERVICE_NAME,
+            protocols: Vec::new(),
+        }
+    }
+}
+
 /// The iroh-based networking node.
 ///
 /// Owns the QUIC endpoint, gossip instance, and protocol router.
@@ -181,15 +368,10 @@ impl P2pNode {
         A: AllowlistStorage + std::fmt::Debug + 'static,
         H: crate::protocol::ProtocolHandler,
     {
-        Self::build(
-            secret_key_bytes,
-            relays,
-            allowlist,
-            false,
-            sync_alpn,
-            sync_handler,
-        )
-        .await
+        Self::builder(secret_key_bytes, relays, allowlist)
+            .with_protocol(sync_alpn, sync_handler)
+            .build()
+            .await
     }
 
     /// Create a `P2pNode` whose endpoint has **no IP transports** — relay-only —
@@ -215,15 +397,11 @@ impl P2pNode {
         A: AllowlistStorage + std::fmt::Debug + 'static,
         H: crate::protocol::ProtocolHandler,
     {
-        Self::build(
-            secret_key_bytes,
-            relays,
-            allowlist,
-            true,
-            sync_alpn,
-            sync_handler,
-        )
-        .await
+        Self::builder(secret_key_bytes, relays, allowlist)
+            .with_protocol(sync_alpn, sync_handler)
+            .relay_only(true)
+            .build()
+            .await
     }
 
     /// Shared constructor body.
@@ -231,17 +409,16 @@ impl P2pNode {
     /// `relay_only` strips IP transports from the endpoint so the only routing
     /// path is a relay. The production callers always pass `false`; only the
     /// `test-util` relay-only constructor passes `true`.
-    async fn build<A, H>(
+    async fn build<A>(
         secret_key_bytes: [u8; 32],
         relays: &[RelayAddr],
         allowlist: Arc<A>,
         relay_only: bool,
-        sync_alpn: &'static [u8],
-        sync_handler: H,
+        mdns_service_name: &'static str,
+        protocols: Vec<(&'static [u8], Box<dyn iroh::protocol::DynProtocolHandler>)>,
     ) -> Result<Self>
     where
         A: AllowlistStorage + std::fmt::Debug + 'static,
-        H: crate::protocol::ProtocolHandler,
     {
         let signing_key = SigningKey::from_bytes(&secret_key_bytes);
         let secret_key = SecretKey::from_bytes(&signing_key.to_bytes());
@@ -306,7 +483,7 @@ impl P2pNode {
             let rt = tokio::runtime::Handle::current();
             match MeshMdns::new(
                 endpoint_to_peer(endpoint.id()),
-                MDNS_SERVICE_NAME,
+                mdns_service_name,
                 port,
                 v4_ips,
                 &rt,
@@ -365,9 +542,12 @@ impl P2pNode {
         // app-supplied sync handler is wrapped in `IrohHandlerAdapter` (a transparent
         // pass-through to iroh's trait); the gossip + pairing handlers are p2p-core's
         // own and stay on iroh's trait directly.
-        let router = Router::builder(endpoint.clone())
-            .accept(GOSSIP_ALPN, gossip_handler)
-            .accept(sync_alpn, IrohHandlerAdapter(sync_handler))
+        let mut router_builder = Router::builder(endpoint.clone())
+            .accept(GOSSIP_ALPN, gossip_handler);
+        for (alpn, handler) in protocols {
+            router_builder = router_builder.accept(alpn, handler);
+        }
+        let router = router_builder
             .accept(PAIRING_ALPN, pairing_handler)
             .spawn();
 
@@ -874,6 +1054,84 @@ impl DialHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builder must fail fast on invalid ALPN / mDNS configuration, before
+    /// binding an endpoint (so a bad name never leaks a bound socket).
+    #[tokio::test]
+    async fn builder_rejects_duplicate_and_reserved_alpns() {
+        #[derive(Debug)]
+        struct Noop;
+        impl crate::protocol::ProtocolHandler for Noop {
+            #[allow(clippy::manual_async_fn)]
+            fn accept(
+                &self,
+                _connection: Connection,
+            ) -> impl std::future::Future<Output = Result<(), crate::protocol::AcceptError>>
+                   + Send {
+                async { Ok(()) }
+            }
+        }
+
+        let allowlist = Arc::new(crate::allowlist::InMemoryAllowlist::new());
+        let key = [7u8; 32];
+
+        let err = P2pNode::builder(key, &[], allowlist.clone())
+            .with_protocol(b"mesh/http-proxy/v1", Noop)
+            .with_protocol(b"mesh/http-proxy/v1", Noop)
+            .build()
+            .await
+            .err()
+            .expect("duplicate ALPN must fail");
+        assert!(err.to_string().contains("duplicate ALPN"), "{err}");
+
+        let err = P2pNode::builder(key, &[], allowlist.clone())
+            .with_protocol(GOSSIP_ALPN, Noop)
+            .build()
+            .await
+            .err()
+            .expect("reserved gossip ALPN must fail");
+        assert!(err.to_string().contains("reserved"), "{err}");
+
+        let err = P2pNode::builder(key, &[], allowlist.clone())
+            .with_protocol(PAIRING_ALPN, Noop)
+            .build()
+            .await
+            .err()
+            .expect("reserved pairing ALPN must fail");
+        assert!(err.to_string().contains("reserved"), "{err}");
+
+        let err = P2pNode::builder(key, &[], allowlist.clone())
+            .with_protocol(b"", Noop)
+            .build()
+            .await
+            .err()
+            .expect("empty ALPN must fail");
+        assert!(err.to_string().contains("must not be empty"), "{err}");
+
+        let err = P2pNode::builder(key, &[], allowlist.clone())
+            .mdns_service_name("")
+            .build()
+            .await
+            .err()
+            .expect("empty mDNS name must fail");
+        assert!(err.to_string().contains("1..=15"), "{err}");
+
+        let err = P2pNode::builder(key, &[], allowlist.clone())
+            .mdns_service_name("webdesserts-mesh")
+            .build()
+            .await
+            .err()
+            .expect("16-byte mDNS name must fail");
+        assert!(err.to_string().contains("1..=15"), "{err}");
+
+        let err = P2pNode::builder(key, &[], allowlist.clone())
+            .mdns_service_name("wd_mesh")
+            .build()
+            .await
+            .err()
+            .expect("invalid mDNS characters must fail");
+        assert!(err.to_string().contains("[a-z0-9-]"), "{err}");
+    }
 
     /// The gossip gate must reject a tombstoned (revoked) peer even though the
     /// tombstone still appears in `list_peers()`. Gating on `list_peers()` (the

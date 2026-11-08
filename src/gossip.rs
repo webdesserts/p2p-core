@@ -43,6 +43,15 @@ impl Topic {
         Topic(topic_from_u64(seed))
     }
 
+    /// Construct a [`Topic`] directly from raw 32-byte topic bytes (e.g. a
+    /// BLAKE3/SHA-256 digest of `(app_id, topic_name)` for `Mesh.app` gossip pokes).
+    ///
+    /// Note: [`Topic::to_u64`] only reads the first 8 little-endian bytes and is
+    /// only meaningful for topics created with [`Topic::from_u64`].
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Topic(TopicId::from_bytes(bytes))
+    }
+
     /// Recover the `u64` seed encoded in this topic's bytes.
     pub fn to_u64(&self) -> u64 {
         u64_from_topic(self.0.as_bytes())
@@ -222,6 +231,20 @@ fn peer_ids_to_endpoints(peers: Vec<PeerId>) -> Vec<iroh::EndpointId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Topic::from_bytes` must round-trip arbitrary 32-byte topics and be
+    /// usable in a `const` context (Mesh.app'"'"'s `POKE_TOPIC`).
+    #[test]
+    fn topic_from_bytes_round_trips() {
+        const TOPIC: Topic = Topic::from_bytes([0xab; 32]);
+        assert_eq!(TOPIC.as_bytes(), &[0xab; 32]);
+
+        let mut bytes = [0u8; 32];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7).wrapping_add(3);
+        }
+        assert_eq!(Topic::from_bytes(bytes).as_bytes(), &bytes);
+    }
 
     /// `Topic::from_u64` and `Topic::to_u64` must be exact inverses so a caller
     /// (vault-sync's `VaultGossipExt`) can recover the seed encoded in a topic.
