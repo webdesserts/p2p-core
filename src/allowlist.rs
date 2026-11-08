@@ -21,6 +21,9 @@ pub enum AllowlistError {
 
     #[error("IO error: {0}")]
     Io(String),
+
+    #[error("Peer {0} has been revoked and cannot be re-added; rotate its device key to re-pair")]
+    PeerRevoked(PeerId),
 }
 
 pub type Result<T> = std::result::Result<T, AllowlistError>;
@@ -171,6 +174,9 @@ pub trait AllowlistStorage: Send + Sync {
         let device_name = device_name.into();
 
         if let Some(existing) = peers.iter_mut().find(|p| p.node_id == node_id) {
+            if existing.removed {
+                return Err(AllowlistError::PeerRevoked(node_id));
+            }
             existing.device_name = device_name;
         } else {
             peers.push(AllowedPeer::new(node_id, device_name));
@@ -381,6 +387,32 @@ mod tests {
         assert_eq!(peers[0].node_id, id);
         assert_eq!(peers[0].device_name, "umbra");
         assert!(peers[0].last_seen.is_none());
+    }
+
+    /// Re-adding a tombstoned peer must fail loudly instead of silently
+    /// renaming the tombstone (which left `removed = true` and returned `Ok`).
+    #[tokio::test]
+    async fn test_add_peer_rejects_tombstoned_peer() {
+        let storage = InMemoryAllowlist::new();
+        let id = peer_a();
+
+        storage.add_peer(id, "device").await.unwrap();
+        storage.remove_peer(&id).await.unwrap();
+
+        let err = storage.add_peer(id, "device-renamed").await.unwrap_err();
+        assert!(
+            matches!(err, AllowlistError::PeerRevoked(revoked) if revoked == id),
+            "re-adding a revoked peer must return PeerRevoked, got {err:?}"
+        );
+        assert!(
+            !storage.is_allowed(&id).await.unwrap(),
+            "the peer stays revoked after the failed re-add"
+        );
+
+        // A rotated key is a fresh device identity and is allowed.
+        let rotated = peer_b();
+        storage.add_peer(rotated, "device-rotated").await.unwrap();
+        assert!(storage.is_allowed(&rotated).await.unwrap());
     }
 
     #[tokio::test]

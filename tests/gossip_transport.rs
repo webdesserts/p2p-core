@@ -152,3 +152,58 @@ async fn subscribe_broadcasts_opaque_bytes_unchanged() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+
+/// A revoked peer must not be able to join the gossip swarm: the allowlist gate
+/// rejects its inbound GOSSIP_ALPN connection, so it never sees a neighbor.
+///
+/// The pair is built here (not via `make_pair`) so the test keeps the allowlist
+/// handles and can revoke B on A *after* both nodes are wired up.
+#[tokio::test]
+async fn revoked_peer_cannot_join_gossip_swarm() -> anyhow::Result<()> {
+    let allowlist_a = Arc::new(InMemoryAllowlist::new());
+    let allowlist_b = Arc::new(InMemoryAllowlist::new());
+
+    let node_a = make_node(seed(1), allowlist_a.clone()).await?;
+    let node_b = make_node(seed(2), allowlist_b.clone()).await?;
+
+    let peer_a = node_a.node_id();
+    let peer_b = node_b.node_id();
+    allowlist_a.add_peer(peer_b, "node-b").await?;
+    allowlist_b.add_peer(peer_a, "node-a").await?;
+
+    let addr_a = node_a.endpoint_for_test().addr();
+    let addr_b = node_b.endpoint_for_test().addr();
+    let lookup_a = MemoryLookup::new();
+    lookup_a.add_endpoint_info(addr_b);
+    node_a.endpoint_for_test().address_lookup()?.add(lookup_a);
+    let lookup_b = MemoryLookup::new();
+    lookup_b.add_endpoint_info(addr_a);
+    node_b.endpoint_for_test().address_lookup()?.add(lookup_b);
+
+    // Revoke B on A. B still trusts A, so B dials A and is rejected there.
+    allowlist_a.remove_peer(&peer_b).await?;
+    assert!(!allowlist_a.is_allowed(&peer_b).await?);
+
+    let topic = Topic::from_u64(0xfeed_face_feed_face);
+    let mut sub_b = node_b.subscribe(topic, vec![peer_a]).await?;
+
+    // B must never see A as a neighbor: A closed the gossip connection.
+    let saw_neighbor = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match sub_b.recv().await {
+                Some(GossipEvent::NeighborUp(_)) => break true,
+                Some(_) => continue,
+                None => break false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+
+    assert!(
+        !saw_neighbor,
+        "a revoked peer must not join the swarm (no NeighborUp within 5s)"
+    );
+    Ok(())
+}

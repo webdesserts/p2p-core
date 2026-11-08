@@ -76,6 +76,22 @@ struct AllowlistGossipHandler<A: AllowlistStorage + std::fmt::Debug> {
     allowlist: Arc<A>,
 }
 
+/// Whether `peer_id` may join the gossip swarm.
+///
+/// This is the single trust gate for gossip: it delegates to
+/// [`AllowlistStorage::is_allowed`], which rejects tombstoned (revoked)
+/// entries. Do NOT gate on `list_peers()` — that returns tombstones too, so a
+/// revoked peer would still pass and keep observing the swarm.
+async fn gossip_peer_allowed<A: AllowlistStorage>(allowlist: &A, peer_id: &PeerId) -> bool {
+    match allowlist.is_allowed(peer_id).await {
+        Ok(allowed) => allowed,
+        Err(e) => {
+            warn!(peer = %peer_id, "Failed to read allowlist for gossip accept, denying: {}", e);
+            false
+        }
+    }
+}
+
 impl<A: AllowlistStorage + std::fmt::Debug + 'static> iroh::protocol::ProtocolHandler
     for AllowlistGossipHandler<A>
 {
@@ -86,13 +102,7 @@ impl<A: AllowlistStorage + std::fmt::Debug + 'static> iroh::protocol::ProtocolHa
         let remote_id = connection.remote_id();
         let peer_id = PeerId::from_bytes(*remote_id.as_bytes());
 
-        let allowed = match self.allowlist.list_peers().await {
-            Ok(peers) => peers.iter().any(|p| p.node_id == peer_id),
-            Err(e) => {
-                warn!(peer = %remote_id, "Failed to read allowlist for gossip accept, denying: {}", e);
-                false
-            }
-        };
+        let allowed = gossip_peer_allowed(self.allowlist.as_ref(), &peer_id).await;
 
         if !allowed {
             warn!(peer = %remote_id, "Gossip connection rejected — peer not in allowlist");
@@ -864,6 +874,43 @@ impl DialHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The gossip gate must reject a tombstoned (revoked) peer even though the
+    /// tombstone still appears in `list_peers()`. Gating on `list_peers()` (the
+    /// pre-fix behaviour) let a revoked device keep observing the swarm.
+    #[tokio::test]
+    async fn gossip_gate_rejects_revoked_peer_but_accepts_live_one() {
+        use crate::allowlist::InMemoryAllowlist;
+
+        let allowlist = InMemoryAllowlist::new();
+        let live = PeerId::generate();
+        let revoked = PeerId::generate();
+
+        allowlist.add_peer(live, "live-device").await.unwrap();
+        allowlist.add_peer(revoked, "revoked-device").await.unwrap();
+        allowlist.remove_peer(&revoked).await.unwrap();
+
+        // The tombstone is still listed — exactly why `list_peers()` was the
+        // wrong gate.
+        let peers = allowlist.list_peers().await.unwrap();
+        assert!(
+            peers.iter().any(|p| p.node_id == revoked),
+            "revoked peer stays in storage as a tombstone"
+        );
+
+        assert!(
+            gossip_peer_allowed(&allowlist, &live).await,
+            "a live peer must still join the swarm"
+        );
+        assert!(
+            !gossip_peer_allowed(&allowlist, &revoked).await,
+            "a revoked peer must be rejected from the swarm"
+        );
+        assert!(
+            !gossip_peer_allowed(&allowlist, &PeerId::generate()).await,
+            "an unknown peer must be rejected"
+        );
+    }
 
     /// `topic_from_u64` and `u64_from_topic` must be exact inverses so a caller
     /// (vault-sync's `VaultGossipExt`) can recover the seed encoded in a topic.
