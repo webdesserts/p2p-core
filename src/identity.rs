@@ -89,6 +89,7 @@ impl KeyStorage for FileKeyStorage {
 /// The public key (derived from this secret) is used as the daemon's `PeerId`.
 /// On first run, a new keypair is generated and the secret key is written to disk.
 /// On subsequent runs, the secret key is loaded to reconstruct a stable identity.
+#[derive(Clone)]
 pub struct IdentityKey {
     signing_key: SigningKey,
 }
@@ -155,6 +156,22 @@ impl IdentityKey {
     pub fn secret_key_bytes(&self) -> [u8; 32] {
         self.signing_key.to_bytes()
     }
+
+    /// Sign `message` with this device's Ed25519 signing key.
+    pub fn sign(&self, message: &[u8]) -> [u8; 64] {
+        use ed25519_dalek::Signer;
+        self.signing_key.sign(message).to_bytes()
+    }
+}
+
+/// Verify an Ed25519 `signature` over `message` against `signer`'s 32-byte public key.
+pub fn verify_peer_signature(signer: &PeerId, message: &[u8], signature: &[u8; 64]) -> bool {
+    use ed25519_dalek::{Signature, VerifyingKey};
+    let Ok(vk) = VerifyingKey::from_bytes(signer.as_bytes()) else {
+        return false;
+    };
+    let sig = Signature::from_bytes(signature);
+    vk.verify_strict(message, &sig).is_ok()
 }
 
 #[cfg(test)]

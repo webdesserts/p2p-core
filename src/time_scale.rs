@@ -2,7 +2,7 @@
 //!
 //! A single process-wide multiplier on the time-based durations the sync stack
 //! owns, so the time-dependent sync test suite runs faster and less flakily
-//! (e.g. `OBSIDIAN_MEMORY_TIME_SCALE=0.1` turns a 30s sync-flag TTL into 3s).
+//! (e.g. `NOTES_TIME_SCALE=0.1` turns a 30s sync-flag TTL into 3s).
 //! It is the *general* lever for durations that lack a per-component test setter;
 //! components with explicit setters (the supervisor/reconcile interval setters)
 //! keep using those for precise control, and this fills the gap for everything
@@ -21,7 +21,7 @@
 //! ## Seeding
 //!
 //! This module uses only [`OnceLock`] and [`std::time::Duration`] and reads NO
-//! environment variable (the `OBSIDIAN_MEMORY_TIME_SCALE` read lives in
+//! environment variable (the `NOTES_TIME_SCALE` read lives in
 //! sync-daemon's `startup_inner`, never here). The daemon seeds the scale once at
 //! startup; any process that never seeds observes the `1.0` default.
 

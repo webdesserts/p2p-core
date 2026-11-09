@@ -18,6 +18,7 @@ pub mod gossip;
 pub mod identity;
 mod iroh_adapt;
 pub mod key_storage;
+pub mod membership;
 pub mod mesh_mdns;
 pub mod node;
 pub mod pairing;
@@ -43,7 +44,7 @@ pub use discovery::{
     mesh_from_discovery_event,
 };
 pub use gossip::{GossipEvent, GossipHandle, GossipSubscription, Topic};
-pub use identity::{FileKeyStorage, IdentityKey};
+pub use identity::{FileKeyStorage, IdentityKey, verify_peer_signature};
 pub use key_storage::{KeyStorage, KeyStorageError};
 pub use mesh_mdns::{MeshMdns, socket_addrs_to_port_addrs};
 pub use node::{

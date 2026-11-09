@@ -40,7 +40,7 @@ pub enum PeerIdError {
 /// let parsed: PeerId = s.parse().unwrap();
 /// assert_eq!(parsed, peer_id);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PeerId([u8; 32]);
 
 impl PeerId {
