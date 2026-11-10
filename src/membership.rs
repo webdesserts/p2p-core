@@ -451,159 +451,20 @@ impl MembershipLog {
             }
         }
 
-        // 4. Single forward pass with a monotone `voided` set.
+        // 4. Pure causal validity over `ancestors` (order-independent).
         let mut voided: BTreeSet<String> = BTreeSet::new();
-        for idx in 0..order.len() {
-            let id = order[idx].clone();
-            if voided.contains(&id) {
-                continue;
-            }
-            let entry = match self.entries.get(&id) {
-                Some(e) => e.clone(),
-                None => continue,
-            };
-            let anc = ancestors.get(&id).cloned().unwrap_or_default();
-            let prefix: BTreeSet<String> = order[..idx].iter().cloned().collect();
-            let signer = entry.signer;
-
-            match &entry.op {
-                MembershipOp::Genesis { .. } => {}
-                MembershipOp::Add {
-                    subject,
-                    relationship,
-                    ..
-                } => {
-                    let mut ok = true;
-                    let auth_anc = authorized_in(&anc, &self.entries, &voided, &genesis_signer);
-                    if signer != genesis_signer && !auth_anc.contains(&signer) {
-                        ok = false;
-                    }
-                    let removed_anc = removed_by_in(&anc, &self.entries, &voided);
-                    if removed_anc.contains_key(&signer) {
-                        ok = false;
-                    }
-                    let (active_now, removed_now) =
-                        state_of(&prefix, &self.entries, &voided, &genesis_signer);
-                    if !active_now.contains(&signer) {
-                        ok = false;
-                    }
-                    if let Some(rs) = removed_now.get(&signer) {
-                        for r in rs {
-                            let r_anc = ancestors.get(r).cloned().unwrap_or_default();
-                            if !r_anc.contains(&id) {
-                                ok = false;
-                            }
-                            let allows = match self.entries.get(r).map(|e| &e.op) {
-                                Some(MembershipOp::Remove { active_after, .. }) => {
-                                    active_after.contains(subject)
-                                }
-                                _ => false,
-                            };
-                            if !allows {
-                                ok = false;
-                            }
-                        }
-                    }
-                    if !ok {
-                        voided.insert(id.clone());
-                    }
-                }
-                MembershipOp::Remove {
-                    subject,
-                    active_after,
-                    ..
-                } => {
-                    let mut ok = true;
-                    let auth_anc = authorized_in(&anc, &self.entries, &voided, &genesis_signer);
-                    if signer != genesis_signer && !auth_anc.contains(&signer) {
-                        ok = false;
-                    }
-                    let removed_anc = removed_by_in(&anc, &self.entries, &voided);
-                    if removed_anc.contains_key(&signer) {
-                        ok = false;
-                    }
-                    let (_, removed_now) =
-                        state_of(&prefix, &self.entries, &voided, &genesis_signer);
-                    if let Some(rs) = removed_now.get(&signer) {
-                        for r in rs {
-                            let r_anc = ancestors.get(r).cloned().unwrap_or_default();
-                            if r_anc.contains(&id) {
-                                continue;
-                            }
-                            let x = match self.entries.get(r) {
-                                Some(e) => e.signer,
-                                None => continue,
-                            };
-                            if x == *subject {
-                                continue;
-                            }
-                            let mut sockpuppet = false;
-                            for a_id in &r_anc {
-                                if let Some(a) = self.entries.get(a_id) {
-                                    if a.signer == *subject {
-                                        if let MembershipOp::Add { subject: s, .. } = &a.op {
-                                            if !anc.contains(a_id) || !active_after.contains(s) {
-                                                sockpuppet = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            if !sockpuppet {
-                                ok = false;
-                            }
-                        }
-                    }
-                    if !ok {
-                        voided.insert(id.clone());
-                        continue;
-                    }
-                    // Accepted: apply the causal cutoff to order[..idx].
-                    for prev in order[..idx].iter() {
-                        if voided.contains(prev) {
-                            continue;
-                        }
-                        let Some(pe) = self.entries.get(prev) else {
-                            continue;
-                        };
-                        let in_anc = anc.contains(prev);
-                        match &pe.op {
-                            MembershipOp::Add { subject: s, .. } if pe.signer == *subject => {
-                                if !in_anc || !active_after.contains(s) {
-                                    voided.insert(prev.clone());
-                                }
-                            }
-                            MembershipOp::Remove { subject: s, .. } if pe.signer == *subject => {
-                                if !in_anc && *s != signer {
-                                    voided.insert(prev.clone());
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    // Transitive cascade: anything signed by a now-unauthorized peer.
-                    loop {
-                        let (active, _) =
-                            state_of(&prefix, &self.entries, &voided, &genesis_signer);
-                        let mut changed = false;
-                        for prev in order[..idx].iter() {
-                            if voided.contains(prev) {
-                                continue;
-                            }
-                            let Some(pe) = self.entries.get(prev) else {
-                                continue;
-                            };
-                            if pe.signer != genesis_signer && !active.contains(&pe.signer) {
-                                voided.insert(prev.clone());
-                                changed = true;
-                            }
-                        }
-                        if !changed {
-                            break;
-                        }
-                    }
-                }
+        for id in &reachable {
+            let mut visiting = HashSet::new();
+            if !is_entry_valid(
+                id,
+                &self.mesh_id,
+                &genesis_signer,
+                &reachable,
+                &self.entries,
+                &ancestors,
+                &mut visiting,
+            ) {
+                voided.insert(id.clone());
             }
         }
 
@@ -683,37 +544,80 @@ impl MembershipLog {
     }
 }
 
-/// Peers currently authorized in `set` (monotone fixpoint over the subset).
-fn authorized_in(
-    set: &BTreeSet<String>,
+/// Does a valid `Remove` entry `r_id` cut off entry `e_id` (signed by `r`'s subject)?
+fn cuts_off(
+    r_id: &str,
+    e_id: &str,
     entries: &BTreeMap<String, SignedMembershipEntry>,
-    voided: &BTreeSet<String>,
+    ancestors: &HashMap<String, BTreeSet<String>>,
+) -> bool {
+    let (Some(r), Some(e)) = (entries.get(r_id), entries.get(e_id)) else {
+        return false;
+    };
+    let MembershipOp::Remove {
+        subject: r_subj,
+        active_after,
+        ..
+    } = &r.op
+    else {
+        return false;
+    };
+    if e.signer != *r_subj {
+        return false;
+    }
+    let in_r_anc = ancestors
+        .get(r_id)
+        .map_or(false, |anc| anc.contains(e_id));
+    match &e.op {
+        MembershipOp::Genesis { .. } => false,
+        MembershipOp::Add { subject: u, .. } => !(in_r_anc && active_after.contains(u)),
+        MembershipOp::Remove { subject: y, .. } => {
+            let r_in_e_anc = ancestors
+                .get(e_id)
+                .map_or(false, |anc| anc.contains(r_id));
+            let concurrent_mutual = !r_in_e_anc && *y == r.signer;
+            !(in_r_anc || concurrent_mutual)
+        }
+    }
+}
+
+/// Is `peer` active within a subset of already-validated ancestor entries?
+fn is_active_in_valid_subset(
+    peer: &PeerId,
+    valid_subset: &BTreeSet<String>,
+    entries: &BTreeMap<String, SignedMembershipEntry>,
     genesis_signer: &PeerId,
-) -> HashSet<PeerId> {
-    let removed = removed_by_in(set, entries, voided);
-    let mut authorized: HashSet<PeerId> = HashSet::new();
-    authorized.insert(*genesis_signer);
+) -> bool {
+    let mut removed: HashSet<PeerId> = HashSet::new();
+    for id in valid_subset {
+        if let Some(e) = entries.get(id) {
+            if let MembershipOp::Remove { subject, .. } = &e.op {
+                removed.insert(*subject);
+            }
+        }
+    }
+    if removed.contains(peer) {
+        return false;
+    }
+    let mut active: HashSet<PeerId> = HashSet::new();
+    if !removed.contains(genesis_signer) {
+        active.insert(*genesis_signer);
+    }
     loop {
         let mut changed = false;
-        for id in set {
-            if voided.contains(id) {
-                continue;
-            }
+        for id in valid_subset {
             let Some(e) = entries.get(id) else {
                 continue;
             };
             if let MembershipOp::Add {
                 subject,
-                relationship,
+                relationship: Relationship::SelfDevice,
                 ..
             } = &e.op
             {
-                if *relationship != Relationship::SelfDevice {
-                    continue;
-                }
-                if authorized.contains(&e.signer)
-                    && !removed.contains_key(subject)
-                    && authorized.insert(*subject)
+                if active.contains(&e.signer)
+                    && !removed.contains(subject)
+                    && active.insert(*subject)
                 {
                     changed = true;
                 }
@@ -723,43 +627,78 @@ fn authorized_in(
             break;
         }
     }
-    authorized
+    active.contains(peer)
 }
 
-/// Non-voided `Remove` entry ids targeting each peer within `set`.
-fn removed_by_in(
-    set: &BTreeSet<String>,
+/// Order-independent recursive causal validity check for a reachable entry.
+fn is_entry_valid(
+    id: &str,
+    mesh_id: &str,
+    genesis_signer: &PeerId,
+    reachable: &BTreeSet<String>,
     entries: &BTreeMap<String, SignedMembershipEntry>,
-    voided: &BTreeSet<String>,
-) -> HashMap<PeerId, Vec<String>> {
-    let mut out: HashMap<PeerId, Vec<String>> = HashMap::new();
-    for id in set {
-        if voided.contains(id) {
-            continue;
-        }
-        if let Some(e) = entries.get(id) {
-            if let MembershipOp::Remove { subject, .. } = &e.op {
-                out.entry(*subject).or_default().push(id.clone());
+    ancestors: &HashMap<String, BTreeSet<String>>,
+    visiting: &mut HashSet<String>,
+) -> bool {
+    if id == mesh_id {
+        return true;
+    }
+    if !visiting.insert(id.to_string()) {
+        // Cycle of concurrent checks fails closed.
+        return false;
+    }
+    let res = (|| {
+        let Some(e) = entries.get(id) else {
+            return false;
+        };
+        let signer = e.signer;
+        let anc = ancestors.get(id).cloned().unwrap_or_default();
+
+        // Step A: signer must be active in the valid subset of `anc(id)`.
+        let mut anc_valid = BTreeSet::new();
+        for a_id in &anc {
+            if is_entry_valid(
+                a_id,
+                mesh_id,
+                genesis_signer,
+                reachable,
+                entries,
+                ancestors,
+                visiting,
+            ) {
+                anc_valid.insert(a_id.clone());
             }
         }
-    }
-    out
-}
+        if !is_active_in_valid_subset(&signer, &anc_valid, entries, genesis_signer) {
+            return false;
+        }
 
-/// `(active, removed_by)` for an ordered prefix.
-fn state_of(
-    prefix: &BTreeSet<String>,
-    entries: &BTreeMap<String, SignedMembershipEntry>,
-    voided: &BTreeSet<String>,
-    genesis_signer: &PeerId,
-) -> (HashSet<PeerId>, HashMap<PeerId, Vec<String>>) {
-    let removed = removed_by_in(prefix, entries, voided);
-    let authorized = authorized_in(prefix, entries, voided, genesis_signer);
-    let active: HashSet<PeerId> = authorized
-        .into_iter()
-        .filter(|p| !removed.contains_key(p))
-        .collect();
-    (active, removed)
+        // Step B: no valid Remove targeting `signer` in `reachable` cuts off `id`.
+        for r_id in reachable {
+            let Some(r) = entries.get(r_id) else {
+                continue;
+            };
+            if let MembershipOp::Remove { subject, .. } = &r.op {
+                if *subject == signer
+                    && cuts_off(r_id, id, entries, ancestors)
+                    && is_entry_valid(
+                        r_id,
+                        mesh_id,
+                        genesis_signer,
+                        reachable,
+                        entries,
+                        ancestors,
+                        visiting,
+                    )
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    })();
+    visiting.remove(id);
+    res
 }
 
 #[cfg(test)]
@@ -1100,5 +1039,138 @@ mod tests {
             .unwrap()
             .insert("unknown_field".to_string(), serde_json::json!(1));
         assert!(serde_json::from_value::<SignedMembershipEntry>(json).is_err());
+    }
+
+    #[tokio::test]
+    async fn peri_revoked_peer_cannot_erase_third_party_or_its_adds() {
+        let dir = TempDir::new().unwrap();
+        let a = ident(&dir, "a").await;
+        let b = ident(&dir, "b").await;
+        let c = ident(&dir, "c").await;
+        let d = ident(&dir, "d").await;
+        let mut failures = Vec::new();
+        for ts in 0..40u64 {
+            let mut log = MembershipLog::new_genesis(&a, "A", "n1", 1).unwrap();
+            let add_b = log
+                .sign_add(&a, b.peer_id(), "B", Relationship::SelfDevice, 2)
+                .unwrap();
+            log.merge_entries(&[add_b.clone()]).unwrap();
+            let add_c = log
+                .sign_add(&a, c.peer_id(), "C", Relationship::SelfDevice, 3)
+                .unwrap();
+            log.merge_entries(&[add_c.clone()]).unwrap();
+            let add_d = log
+                .sign_add(&c, d.peer_id(), "D", Relationship::SelfDevice, 4)
+                .unwrap();
+            log.merge_entries(&[add_d.clone()]).unwrap();
+            let rm_b = log.sign_remove(&a, b.peer_id(), 5).unwrap();
+            log.merge_entries(&[rm_b.clone()]).unwrap();
+            let rm_c_by_b = SignedMembershipEntry::sign(
+                &b,
+                100 + ts,
+                remove_op(
+                    &log.mesh_id,
+                    c.peer_id(),
+                    vec![add_b.entry_id.clone(), add_c.entry_id.clone()],
+                    vec![b.peer_id()],
+                ),
+            )
+            .unwrap();
+            let pre = log.evaluate();
+            assert!(
+                pre.active.contains_key(&c.peer_id()) && pre.active.contains_key(&d.peer_id()),
+                "control failed"
+            );
+            log.merge_entries(&[rm_c_by_b.clone()]).unwrap();
+            let e = log.evaluate();
+            let c_ok = e.active.contains_key(&c.peer_id());
+            let d_ok = e.active.contains_key(&d.peer_id());
+            if !c_ok || !d_ok {
+                failures.push((
+                    ts,
+                    c_ok,
+                    d_ok,
+                    rm_c_by_b.entry_id < add_d.entry_id,
+                    rm_c_by_b.entry_id < rm_b.entry_id,
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} of 40 failed (ts, C active, D active, rmC<addD, rmC<rmB): {:?}",
+            failures.len(),
+            failures
+        );
+    }
+
+    #[tokio::test]
+    async fn revoked_signer_entry_outside_revocation_ancestors_never_changes_state() {
+        let dir = TempDir::new().unwrap();
+        let a = ident(&dir, "a").await;
+        let b = ident(&dir, "b").await;
+        let c = ident(&dir, "c").await;
+        let d = ident(&dir, "d").await;
+        let e_peer = ident(&dir, "e").await;
+
+        let mut base = MembershipLog::new_genesis(&a, "A", "n1", 1).unwrap();
+        let add_b = base
+            .sign_add(&a, b.peer_id(), "B", Relationship::SelfDevice, 2)
+            .unwrap();
+        base.merge_entries(&[add_b.clone()]).unwrap();
+        let add_c = base
+            .sign_add(&a, c.peer_id(), "C", Relationship::SelfDevice, 3)
+            .unwrap();
+        base.merge_entries(&[add_c.clone()]).unwrap();
+        let add_d = base
+            .sign_add(&c, d.peer_id(), "D", Relationship::SelfDevice, 4)
+            .unwrap();
+        base.merge_entries(&[add_d.clone()]).unwrap();
+        let rm_b = base.sign_remove(&a, b.peer_id(), 5).unwrap();
+        base.merge_entries(&[rm_b.clone()]).unwrap();
+
+        let baseline = base.evaluate();
+
+        for ts in 0..30u64 {
+            let forged_add = SignedMembershipEntry::sign(
+                &b,
+                50 + ts,
+                add_op(
+                    &base.mesh_id,
+                    e_peer.peer_id(),
+                    "E",
+                    vec![add_b.entry_id.clone(), add_c.entry_id.clone()],
+                ),
+            )
+            .unwrap();
+            let forged_rm_c = SignedMembershipEntry::sign(
+                &b,
+                200 + ts,
+                remove_op(
+                    &base.mesh_id,
+                    c.peer_id(),
+                    vec![add_b.entry_id.clone(), add_c.entry_id.clone()],
+                    vec![b.peer_id()],
+                ),
+            )
+            .unwrap();
+            let forged_rm_d = SignedMembershipEntry::sign(
+                &b,
+                400 + ts,
+                remove_op(
+                    &base.mesh_id,
+                    d.peer_id(),
+                    vec![add_b.entry_id.clone(), add_d.entry_id.clone()],
+                    vec![b.peer_id()],
+                ),
+            )
+            .unwrap();
+
+            let mut log = base.clone();
+            log.merge_entries(&[forged_add, forged_rm_c, forged_rm_d])
+                .unwrap();
+            let eval = log.evaluate();
+            assert_eq!(eval.active, baseline.active, "active changed at ts={ts}");
+            assert_eq!(eval.revoked, baseline.revoked, "revoked changed at ts={ts}");
+        }
     }
 }
