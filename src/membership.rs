@@ -432,34 +432,15 @@ impl MembershipLog {
             })
             .cloned()
             .collect();
-        let mut memo: HashMap<String, bool> = HashMap::new();
-        let mut voided: BTreeSet<String> = BTreeSet::new();
-        for id in &order {
-            let mut visiting = HashSet::new();
-            if !is_entry_valid(
-                id,
-                &self.mesh_id,
-                &genesis_signer,
-                &order,
-                &remove_ids,
-                &self.entries,
-                &ancestors,
-                &mut visiting,
-                &mut memo,
-            )
-            .0
-            {
-                voided.insert(id.clone());
-            }
-        }
-
-        // 5. Materialize roster + heads over all reachable entries.
-        let mut valid: BTreeSet<String> = BTreeSet::new();
-        for id in &order {
-            if !voided.contains(id) {
-                valid.insert(id.clone());
-            }
-        }
+        // 5. Materialize valid entries + roster + heads over all reachable entries.
+        let valid = resolve_valid_entries(
+            &self.mesh_id,
+            &genesis_signer,
+            &order,
+            &remove_ids,
+            &self.entries,
+            &ancestors,
+        );
         let mut revoked: BTreeMap<PeerId, u64> = BTreeMap::new();
         let mut active: BTreeMap<PeerId, ActiveMember> = BTreeMap::new();
         for id in &order {
@@ -529,8 +510,8 @@ impl MembershipLog {
     }
 }
 
-/// Does a valid `Remove` entry `r_id` cut off entry `e_id` (signed by `r`'s subject)?
-fn cuts_off(
+/// Does a `Remove` entry `r_id` cut off an `Add` entry `e_id` (signed by `r`'s subject)?
+fn cuts_off_add(
     r_id: &str,
     e_id: &str,
     entries: &BTreeMap<String, SignedMembershipEntry>,
@@ -550,20 +531,42 @@ fn cuts_off(
     if e.signer != *r_subj {
         return false;
     }
+    let MembershipOp::Add { subject: u, .. } = &e.op else {
+        return false;
+    };
     let in_r_anc = ancestors
         .get(r_id)
         .map_or(false, |anc| anc.contains(e_id));
-    match &e.op {
-        MembershipOp::Genesis { .. } => false,
-        MembershipOp::Add { subject: u, .. } => !(in_r_anc && active_after.contains(u)),
-        MembershipOp::Remove { subject: y, .. } => {
-            let r_in_e_anc = ancestors
-                .get(e_id)
-                .map_or(false, |anc| anc.contains(r_id));
-            let concurrent_mutual = !r_in_e_anc && *y == r.signer;
-            !(in_r_anc || concurrent_mutual)
-        }
+    !(in_r_anc && active_after.contains(u))
+}
+
+/// Does a `Remove` entry `r_id` raw-cut-off another `Remove` entry `e_id` (signed by `r`'s subject
+/// and not in `anc(r_id)`) before cycle condensation?
+fn raw_cuts_off_remove(
+    r_id: &str,
+    e_id: &str,
+    entries: &BTreeMap<String, SignedMembershipEntry>,
+    ancestors: &HashMap<String, BTreeSet<String>>,
+) -> bool {
+    if r_id == e_id {
+        return false;
     }
+    let (Some(r), Some(e)) = (entries.get(r_id), entries.get(e_id)) else {
+        return false;
+    };
+    let MembershipOp::Remove {
+        subject: r_subj, ..
+    } = &r.op
+    else {
+        return false;
+    };
+    if e.signer != *r_subj || !matches!(e.op, MembershipOp::Remove { .. }) {
+        return false;
+    }
+    let in_r_anc = ancestors
+        .get(r_id)
+        .map_or(false, |anc| anc.contains(e_id));
+    !in_r_anc
 }
 
 /// Is `peer` active within a subset of already-validated ancestor entries?
@@ -615,100 +618,236 @@ fn is_active_in_valid_subset(
     active.contains(peer)
 }
 
-/// Order-independent recursive causal validity check for a reachable entry.
-/// Returns `(is_valid, hit_cycle)`; results with `!hit_cycle` are independent of
-/// `visiting` and safely memoized across the evaluation pass.
-fn is_entry_valid(
-    id: &str,
+/// Forward causal validity pass over topological `order`, given entries already `killed`
+/// by upstream `Remove`s and `final_valid_removes` already finalized by source SCCs.
+fn compute_causally_valid_entries(
+    mesh_id: &str,
+    genesis_signer: &PeerId,
+    order: &[String],
+    entries: &BTreeMap<String, SignedMembershipEntry>,
+    ancestors: &HashMap<String, BTreeSet<String>>,
+    killed: &HashSet<String>,
+    final_valid_removes: &HashSet<String>,
+) -> HashSet<String> {
+    let mut valid: HashSet<String> = HashSet::with_capacity(order.len());
+    for id in order {
+        if final_valid_removes.contains(id) {
+            valid.insert(id.clone());
+            continue;
+        }
+        if killed.contains(id) {
+            continue;
+        }
+        if id == mesh_id {
+            valid.insert(id.clone());
+            continue;
+        }
+        let Some(e) = entries.get(id) else {
+            continue;
+        };
+        let is_remove = matches!(e.op, MembershipOp::Remove { .. });
+        let mut anc_valid: HashSet<&str> = HashSet::new();
+        if let Some(anc) = ancestors.get(id) {
+            for a_id in anc {
+                if !valid.contains(a_id) {
+                    continue;
+                }
+                if is_remove && cuts_off_add(id, a_id, entries, ancestors) {
+                    continue;
+                }
+                anc_valid.insert(a_id.as_str());
+            }
+        }
+        if is_active_in_valid_subset(&e.signer, &anc_valid, order, entries, genesis_signer) {
+            valid.insert(id.clone());
+        }
+    }
+    valid
+}
+
+/// Does candidate `Remove` `r_i` threaten candidate `Remove` `r_j` either directly
+/// (`raw_cuts_off_remove`) or by cutting off `Add` ancestors of `r_j` required for `r_j.signer`?
+fn remove_threatens_remove(
+    r_i: &str,
+    r_j: &str,
+    causal_valid: &HashSet<String>,
+    order: &[String],
+    entries: &BTreeMap<String, SignedMembershipEntry>,
+    ancestors: &HashMap<String, BTreeSet<String>>,
+    genesis_signer: &PeerId,
+) -> bool {
+    if raw_cuts_off_remove(r_i, r_j, entries, ancestors) {
+        return true;
+    }
+    let Some(e_j) = entries.get(r_j) else {
+        return false;
+    };
+    let Some(anc_j) = ancestors.get(r_j) else {
+        return false;
+    };
+    let mut cut_any_add = false;
+    let mut reduced_anc: HashSet<&str> = HashSet::new();
+    for a_id in anc_j {
+        if !causal_valid.contains(a_id) {
+            continue;
+        }
+        if cuts_off_add(r_j, a_id, entries, ancestors) {
+            continue;
+        }
+        if cuts_off_add(r_i, a_id, entries, ancestors) {
+            cut_any_add = true;
+            continue;
+        }
+        reduced_anc.insert(a_id.as_str());
+    }
+    cut_any_add && !is_active_in_valid_subset(&e_j.signer, &reduced_anc, order, entries, genesis_signer)
+}
+
+/// Tarjan's Strongly Connected Components algorithm (`O(V + E)`).
+/// Returns `(scc_id_per_vertex, num_sccs)`.
+fn tarjan_scc(n: usize, adj: &[Vec<usize>]) -> (Vec<usize>, usize) {
+    struct State {
+        index: usize,
+        indices: Vec<Option<usize>>,
+        lowlink: Vec<usize>,
+        on_stack: Vec<bool>,
+        stack: Vec<usize>,
+        scc_id: Vec<usize>,
+        num_sccs: usize,
+    }
+    fn strongconnect(v: usize, adj: &[Vec<usize>], st: &mut State) {
+        st.indices[v] = Some(st.index);
+        st.lowlink[v] = st.index;
+        st.index += 1;
+        st.stack.push(v);
+        st.on_stack[v] = true;
+
+        for &w in &adj[v] {
+            if st.indices[w].is_none() {
+                strongconnect(w, adj, st);
+                st.lowlink[v] = st.lowlink[v].min(st.lowlink[w]);
+            } else if st.on_stack[w] {
+                st.lowlink[v] = st.lowlink[v].min(st.indices[w].unwrap());
+            }
+        }
+
+        if st.lowlink[v] == st.indices[v].unwrap() {
+            let id = st.num_sccs;
+            st.num_sccs += 1;
+            while let Some(w) = st.stack.pop() {
+                st.on_stack[w] = false;
+                st.scc_id[w] = id;
+                if w == v {
+                    break;
+                }
+            }
+        }
+    }
+    let mut st = State {
+        index: 0,
+        indices: vec![None; n],
+        lowlink: vec![0; n],
+        on_stack: vec![false; n],
+        stack: Vec::with_capacity(n),
+        scc_id: vec![0; n],
+        num_sccs: 0,
+    };
+    for v in 0..n {
+        if st.indices[v].is_none() {
+            strongconnect(v, adj, &mut st);
+        }
+    }
+    (st.scc_id, st.num_sccs)
+}
+
+/// Order-independent polynomial causal validity resolution via Top-Down SCC Peeling.
+fn resolve_valid_entries(
     mesh_id: &str,
     genesis_signer: &PeerId,
     order: &[String],
     remove_ids: &[String],
     entries: &BTreeMap<String, SignedMembershipEntry>,
     ancestors: &HashMap<String, BTreeSet<String>>,
-    visiting: &mut HashSet<String>,
-    memo: &mut HashMap<String, bool>,
-) -> (bool, bool) {
-    if id == mesh_id {
-        return (true, false);
-    }
-    if let Some(&cached) = memo.get(id) {
-        return (cached, false);
-    }
-    if !visiting.insert(id.to_string()) {
-        // Cycle of concurrent checks fails closed.
-        return (false, true);
-    }
-    let (res, tainted) = (|| {
-        let Some(e) = entries.get(id) else {
-            return (false, false);
-        };
-        let signer = e.signer;
-        let is_remove = matches!(e.op, MembershipOp::Remove { .. });
-        let mut tainted = false;
+) -> BTreeSet<String> {
+    let mut killed: HashSet<String> = HashSet::new();
+    let mut final_valid_removes: HashSet<String> = HashSet::new();
 
-        // Step A: signer must be active in the valid subset of `anc(id)`.
-        let mut anc_valid: HashSet<&str> = HashSet::new();
-        if let Some(anc) = ancestors.get(id) {
-            for a_id in anc {
-                if is_remove && cuts_off(id, a_id, entries, ancestors) {
-                    continue;
-                }
-                let (ok, cyc) = is_entry_valid(
-                    a_id,
-                    mesh_id,
-                    genesis_signer,
-                    order,
-                    remove_ids,
-                    entries,
-                    ancestors,
-                    visiting,
-                    memo,
-                );
-                tainted |= cyc;
-                if ok {
-                    anc_valid.insert(a_id.as_str());
-                }
-            }
-        }
-        if !is_active_in_valid_subset(&signer, &anc_valid, order, entries, genesis_signer) {
-            return (false, tainted);
+    loop {
+        let causal_valid = compute_causally_valid_entries(
+            mesh_id,
+            genesis_signer,
+            order,
+            entries,
+            ancestors,
+            &killed,
+            &final_valid_removes,
+        );
+        let cand: Vec<String> = remove_ids
+            .iter()
+            .filter(|r_id| {
+                causal_valid.contains(*r_id) && !final_valid_removes.contains(*r_id)
+            })
+            .cloned()
+            .collect();
+        if cand.is_empty() {
+            return causal_valid.into_iter().collect();
         }
 
-        // Step B: no valid Remove targeting `signer` in `reachable` cuts off `id`.
-        for r_id in remove_ids {
-            let Some(r) = entries.get(r_id) else {
-                continue;
-            };
-            if let MembershipOp::Remove { subject, .. } = &r.op {
-                if *subject == signer && cuts_off(r_id, id, entries, ancestors) {
-                    let (r_ok, cyc) = is_entry_valid(
-                        r_id,
-                        mesh_id,
-                        genesis_signer,
+        let n = cand.len();
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for i in 0..n {
+            for j in 0..n {
+                if i != j
+                    && remove_threatens_remove(
+                        &cand[i],
+                        &cand[j],
+                        &causal_valid,
                         order,
-                        remove_ids,
                         entries,
                         ancestors,
-                        visiting,
-                        memo,
-                    );
-                    tainted |= cyc;
-                    if r_ok {
-                        return (false, tainted);
-                    }
+                        genesis_signer,
+                    )
+                {
+                    adj[i].push(j);
                 }
             }
         }
-        (true, tainted)
-    })();
-    visiting.remove(id);
-    if !tainted {
-        memo.insert(id.to_string(), res);
-    }
-    (res, tainted)
-}
 
+        let (scc_id, num_sccs) = tarjan_scc(n, &adj);
+        let mut scc_in_degree = vec![0usize; num_sccs];
+        for u in 0..n {
+            for &v in &adj[u] {
+                if scc_id[u] != scc_id[v] {
+                    scc_in_degree[scc_id[v]] += 1;
+                }
+            }
+        }
+
+        let mut source_members: HashSet<&str> = HashSet::new();
+        for u in 0..n {
+            if scc_in_degree[scc_id[u]] == 0 {
+                source_members.insert(cand[u].as_str());
+            }
+        }
+        for u in 0..n {
+            if scc_in_degree[scc_id[u]] != 0 {
+                continue;
+            }
+            let r_u = &cand[u];
+            final_valid_removes.insert(r_u.clone());
+            for e_id in order {
+                if final_valid_removes.contains(e_id) || source_members.contains(e_id.as_str()) {
+                    continue;
+                }
+                if cuts_off_add(r_u, e_id, entries, ancestors)
+                    || raw_cuts_off_remove(r_u, e_id, entries, ancestors)
+                {
+                    killed.insert(e_id.clone());
+                }
+            }
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1292,5 +1431,78 @@ mod tests {
             elapsed_ms < 100.0,
             "evaluate() on 200-entry chain took {elapsed_ms:.2} ms (limit 100 ms)"
         );
+    }
+
+    #[tokio::test]
+    async fn membership_concurrent_remove_rings_and_all_pairs_fail_closed() {
+        let dir = TempDir::new().unwrap();
+        for k in 2..=6usize {
+            let mut ids = Vec::new();
+            for i in 0..k {
+                ids.push(ident(&dir, &format!("k{k}p{i}")).await);
+            }
+            let mut log = MembershipLog::new_genesis(&ids[0], "P0", "n1", 1).unwrap();
+            let mut last = log.mesh_id.clone();
+            for i in 1..k {
+                let e = log
+                    .sign_add(
+                        &ids[0],
+                        ids[i].peer_id(),
+                        "P",
+                        Relationship::SelfDevice,
+                        1 + i as u64,
+                    )
+                    .unwrap();
+                last = e.entry_id.clone();
+                log.merge_entries(&[e]).unwrap();
+            }
+            for mode in ["ring", "all"] {
+                let mut l = log.clone();
+                let mut rms = Vec::new();
+                for i in 0..k {
+                    for j in 0..k {
+                        if i == j {
+                            continue;
+                        }
+                        if mode == "ring" && j != (i + 1) % k {
+                            continue;
+                        }
+                        let after: Vec<_> = (0..k)
+                            .filter(|x| *x != j)
+                            .map(|x| ids[x].peer_id())
+                            .collect();
+                        rms.push(
+                            SignedMembershipEntry::sign(
+                                &ids[i],
+                                100 + (i * k + j) as u64,
+                                remove_op(&l.mesh_id, ids[j].peer_id(), vec![last.clone()], after),
+                            )
+                            .unwrap(),
+                        );
+                    }
+                }
+                l.merge_entries(&rms).unwrap();
+                let t = std::time::Instant::now();
+                let ev = l.evaluate();
+                let ms = t.elapsed().as_secs_f64() * 1000.0;
+                assert!(
+                    ev.active.is_empty(),
+                    "mode={mode} k={k}: expected 0 active (fail-closed), got {}",
+                    ev.active.len()
+                );
+                assert_eq!(ev.revoked.len(), k, "mode={mode} k={k}: expected all {k} revoked");
+                for rm in &rms {
+                    assert!(
+                        ev.valid.contains(&rm.entry_id),
+                        "mode={mode} k={k}: expected Remove {} to be valid",
+                        rm.entry_id
+                    );
+                }
+                assert!(
+                    ms < 50.0,
+                    "mode={mode} k={k}: evaluate() took {ms:.2} ms (limit 50 ms)"
+                );
+            }
+        }
     }
 }
