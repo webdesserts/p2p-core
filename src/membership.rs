@@ -361,109 +361,94 @@ impl MembershipLog {
         }
         let genesis_signer = genesis.signer;
 
-        // 1. Reachable closure from genesis (drops cycles / missing parents / unverified entries).
-        let mut reachable: BTreeSet<String> = BTreeSet::new();
-        reachable.insert(self.mesh_id.clone());
-        loop {
-            let mut added = false;
-            for (id, entry) in &self.entries {
-                if reachable.contains(id) {
-                    continue;
-                }
-                if entry.entry_id != *id || entry.mesh_id() != self.mesh_id || !entry.verify() {
-                    continue;
-                }
-                let parents = entry.parent_heads();
-                if parents.is_empty() {
-                    continue;
-                }
-                if parents.iter().all(|p| reachable.contains(p)) {
-                    reachable.insert(id.clone());
-                    added = true;
-                }
-            }
-            if !added {
-                break;
-            }
-        }
-
-        // 2. Strict ancestors within Reachable.
-        let mut ancestors: HashMap<String, BTreeSet<String>> = HashMap::new();
-        for id in &reachable {
-            let mut set: BTreeSet<String> = BTreeSet::new();
-            let mut stack: Vec<String> = self
-                .entries
-                .get(id)
-                .map(|e| e.parent_heads())
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|p| reachable.contains(p))
-                .collect();
-            while let Some(p) = stack.pop() {
-                if set.insert(p.clone()) {
-                    if let Some(e) = self.entries.get(&p) {
-                        for q in e.parent_heads() {
-                            if reachable.contains(&q) {
-                                stack.push(q);
-                            }
-                        }
-                    }
-                }
-            }
-            ancestors.insert(id.clone(), set);
-        }
-
-        // 3. Canonical Kahn order (ties broken by entry_id).
-        let mut indeg: HashMap<String, usize> = HashMap::new();
+        // 1–3. Single-pass Kahn reachability, canonical topological order, and strict ancestors.
+        let mut parent_map: HashMap<String, BTreeSet<String>> = HashMap::new();
+        let mut rem_parents: HashMap<String, usize> = HashMap::new();
         let mut children: HashMap<String, Vec<String>> = HashMap::new();
-        for id in &reachable {
-            let parents: BTreeSet<String> = self
-                .entries
-                .get(id)
-                .map(|e| e.parent_heads())
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|p| reachable.contains(p))
-                .collect();
-            indeg.insert(id.clone(), parents.len());
-            for p in parents {
-                children.entry(p).or_default().push(id.clone());
+        for (id, entry) in &self.entries {
+            if id == &self.mesh_id {
+                continue;
             }
+            if entry.entry_id != *id || entry.mesh_id() != self.mesh_id {
+                continue;
+            }
+            let parents: BTreeSet<String> = entry.parent_heads().into_iter().collect();
+            if parents.is_empty() || !parents.iter().all(|p| self.entries.contains_key(p)) {
+                continue;
+            }
+            rem_parents.insert(id.clone(), parents.len());
+            for p in &parents {
+                children.entry(p.clone()).or_default().push(id.clone());
+            }
+            parent_map.insert(id.clone(), parents);
         }
-        let mut ready: BTreeSet<String> = indeg
-            .iter()
-            .filter(|(_, d)| **d == 0)
-            .map(|(k, _)| k.clone())
-            .collect();
+
+        let mut reachable: BTreeSet<String> = BTreeSet::new();
         let mut order: Vec<String> = Vec::new();
-        while let Some(id) = ready.iter().next().cloned() {
-            ready.remove(&id);
+        let mut ancestors: HashMap<String, BTreeSet<String>> = HashMap::new();
+        let mut ready: BTreeSet<String> = BTreeSet::new();
+        ready.insert(self.mesh_id.clone());
+
+        while let Some(id) = ready.pop_first() {
+            if id != self.mesh_id {
+                let Some(entry) = self.entries.get(&id) else {
+                    continue;
+                };
+                if !entry.verify() {
+                    continue;
+                }
+            }
+            let mut anc: BTreeSet<String> = BTreeSet::new();
+            if let Some(ps) = parent_map.get(&id) {
+                for p in ps {
+                    anc.insert(p.clone());
+                    if let Some(p_anc) = ancestors.get(p) {
+                        anc.extend(p_anc.iter().cloned());
+                    }
+                }
+            }
+            ancestors.insert(id.clone(), anc);
+            reachable.insert(id.clone());
             order.push(id.clone());
+
             if let Some(cs) = children.get(&id) {
-                for c in cs.clone() {
-                    if let Some(d) = indeg.get_mut(&c) {
-                        *d -= 1;
-                        if *d == 0 {
-                            ready.insert(c);
+                for c in cs {
+                    if let Some(rem) = rem_parents.get_mut(c) {
+                        *rem -= 1;
+                        if *rem == 0 {
+                            ready.insert(c.clone());
                         }
                     }
                 }
             }
         }
-
-        // 4. Pure causal validity over `ancestors` (order-independent).
+        // 4. Pure causal validity over `ancestors` (order-independent, cycle-safe memoized).
+        let remove_ids: Vec<String> = order
+            .iter()
+            .filter(|id| {
+                self.entries
+                    .get(*id)
+                    .is_some_and(|e| matches!(e.op, MembershipOp::Remove { .. }))
+            })
+            .cloned()
+            .collect();
+        let mut memo: HashMap<String, bool> = HashMap::new();
         let mut voided: BTreeSet<String> = BTreeSet::new();
-        for id in &reachable {
+        for id in &order {
             let mut visiting = HashSet::new();
             if !is_entry_valid(
                 id,
                 &self.mesh_id,
                 &genesis_signer,
-                &reachable,
+                &order,
+                &remove_ids,
                 &self.entries,
                 &ancestors,
                 &mut visiting,
-            ) {
+                &mut memo,
+            )
+            .0
+            {
                 voided.insert(id.clone());
             }
         }
@@ -582,15 +567,17 @@ fn cuts_off(
 }
 
 /// Is `peer` active within a subset of already-validated ancestor entries?
+/// Iterates `order` (topological order) so a single forward pass suffices.
 fn is_active_in_valid_subset(
     peer: &PeerId,
-    valid_subset: &BTreeSet<String>,
+    valid_subset: &HashSet<&str>,
+    order: &[String],
     entries: &BTreeMap<String, SignedMembershipEntry>,
     genesis_signer: &PeerId,
 ) -> bool {
     let mut removed: HashSet<PeerId> = HashSet::new();
     for id in valid_subset {
-        if let Some(e) = entries.get(id) {
+        if let Some(e) = entries.get(*id) {
             if let MembershipOp::Remove { subject, .. } = &e.op {
                 removed.insert(*subject);
             }
@@ -599,106 +586,127 @@ fn is_active_in_valid_subset(
     if removed.contains(peer) {
         return false;
     }
-    let mut active: HashSet<PeerId> = HashSet::new();
-    if !removed.contains(genesis_signer) {
-        active.insert(*genesis_signer);
+    if peer == genesis_signer {
+        return true;
     }
-    loop {
-        let mut changed = false;
-        for id in valid_subset {
-            let Some(e) = entries.get(id) else {
-                continue;
-            };
-            if let MembershipOp::Add {
-                subject,
-                relationship: Relationship::SelfDevice,
-                ..
-            } = &e.op
-            {
-                if active.contains(&e.signer)
-                    && !removed.contains(subject)
-                    && active.insert(*subject)
-                {
-                    changed = true;
+    let mut active: HashSet<PeerId> = HashSet::new();
+    active.insert(*genesis_signer);
+    for id in order {
+        if !valid_subset.contains(id.as_str()) {
+            continue;
+        }
+        let Some(e) = entries.get(id) else {
+            continue;
+        };
+        if let MembershipOp::Add {
+            subject,
+            relationship: Relationship::SelfDevice,
+            ..
+        } = &e.op
+        {
+            if active.contains(&e.signer) && !removed.contains(subject) {
+                active.insert(*subject);
+                if subject == peer {
+                    return true;
                 }
             }
-        }
-        if !changed {
-            break;
         }
     }
     active.contains(peer)
 }
 
 /// Order-independent recursive causal validity check for a reachable entry.
+/// Returns `(is_valid, hit_cycle)`; results with `!hit_cycle` are independent of
+/// `visiting` and safely memoized across the evaluation pass.
 fn is_entry_valid(
     id: &str,
     mesh_id: &str,
     genesis_signer: &PeerId,
-    reachable: &BTreeSet<String>,
+    order: &[String],
+    remove_ids: &[String],
     entries: &BTreeMap<String, SignedMembershipEntry>,
     ancestors: &HashMap<String, BTreeSet<String>>,
     visiting: &mut HashSet<String>,
-) -> bool {
+    memo: &mut HashMap<String, bool>,
+) -> (bool, bool) {
     if id == mesh_id {
-        return true;
+        return (true, false);
+    }
+    if let Some(&cached) = memo.get(id) {
+        return (cached, false);
     }
     if !visiting.insert(id.to_string()) {
         // Cycle of concurrent checks fails closed.
-        return false;
+        return (false, true);
     }
-    let res = (|| {
+    let (res, tainted) = (|| {
         let Some(e) = entries.get(id) else {
-            return false;
+            return (false, false);
         };
         let signer = e.signer;
-        let anc = ancestors.get(id).cloned().unwrap_or_default();
+        let is_remove = matches!(e.op, MembershipOp::Remove { .. });
+        let mut tainted = false;
 
         // Step A: signer must be active in the valid subset of `anc(id)`.
-        let mut anc_valid = BTreeSet::new();
-        for a_id in &anc {
-            if is_entry_valid(
-                a_id,
-                mesh_id,
-                genesis_signer,
-                reachable,
-                entries,
-                ancestors,
-                visiting,
-            ) {
-                anc_valid.insert(a_id.clone());
+        let mut anc_valid: HashSet<&str> = HashSet::new();
+        if let Some(anc) = ancestors.get(id) {
+            for a_id in anc {
+                if is_remove && cuts_off(id, a_id, entries, ancestors) {
+                    continue;
+                }
+                let (ok, cyc) = is_entry_valid(
+                    a_id,
+                    mesh_id,
+                    genesis_signer,
+                    order,
+                    remove_ids,
+                    entries,
+                    ancestors,
+                    visiting,
+                    memo,
+                );
+                tainted |= cyc;
+                if ok {
+                    anc_valid.insert(a_id.as_str());
+                }
             }
         }
-        if !is_active_in_valid_subset(&signer, &anc_valid, entries, genesis_signer) {
-            return false;
+        if !is_active_in_valid_subset(&signer, &anc_valid, order, entries, genesis_signer) {
+            return (false, tainted);
         }
 
         // Step B: no valid Remove targeting `signer` in `reachable` cuts off `id`.
-        for r_id in reachable {
+        for r_id in remove_ids {
             let Some(r) = entries.get(r_id) else {
                 continue;
             };
             if let MembershipOp::Remove { subject, .. } = &r.op {
-                if *subject == signer
-                    && cuts_off(r_id, id, entries, ancestors)
-                    && is_entry_valid(
+                if *subject == signer && cuts_off(r_id, id, entries, ancestors) {
+                    let (r_ok, cyc) = is_entry_valid(
                         r_id,
                         mesh_id,
                         genesis_signer,
-                        reachable,
+                        order,
+                        remove_ids,
                         entries,
                         ancestors,
                         visiting,
-                    )
-                {
-                    return false;
+                        memo,
+                    );
+                    tainted |= cyc;
+                    if r_ok {
+                        return (false, tainted);
+                    }
                 }
             }
         }
-        true
+        (true, tainted)
     })();
     visiting.remove(id);
-    res
+    if !tainted {
+        memo.insert(id.to_string(), res);
+    }
+    (res, tainted)
 }
 
 #[cfg(test)]
@@ -1028,7 +1036,7 @@ mod tests {
         bad_signer.signer = c.peer_id();
         assert!(log.merge_entries(&[bad_signer]).is_err());
 
-        let mut other = MembershipLog::new_genesis(&c, "C", "n2", 1).unwrap();
+        let other = MembershipLog::new_genesis(&c, "C", "n2", 1).unwrap();
         let foreign = other
             .sign_add(&c, a.peer_id(), "A", Relationship::SelfDevice, 2)
             .unwrap();
@@ -1172,5 +1180,117 @@ mod tests {
             assert_eq!(eval.active, baseline.active, "active changed at ts={ts}");
             assert_eq!(eval.revoked, baseline.revoked, "revoked changed at ts={ts}");
         }
+    }
+
+    #[tokio::test]
+    async fn membership_concurrent_three_way_removal_ring_fails_closed() {
+        // Intended result: when three active peers concurrently remove each other in a ring
+        // (A removes B, B removes C, C removes A), the cycle guard fails closed so none of the
+        // ring members can use its own revoked status to shield itself — all three Remove entries
+        // remain valid and all three peers (A, B, C) are revoked, matching 2-way mutual removal.
+        let dir = TempDir::new().unwrap();
+        let a = ident(&dir, "a").await;
+        let b = ident(&dir, "b").await;
+        let c = ident(&dir, "c").await;
+
+        let mut base = MembershipLog::new_genesis(&a, "A", "n1", 1).unwrap();
+        let add_b = base
+            .sign_add(&a, b.peer_id(), "B", Relationship::SelfDevice, 2)
+            .unwrap();
+        base.merge_entries(&[add_b.clone()]).unwrap();
+        let add_c = base
+            .sign_add(&a, c.peer_id(), "C", Relationship::SelfDevice, 3)
+            .unwrap();
+        base.merge_entries(&[add_c.clone()]).unwrap();
+
+        let parents = vec![add_b.entry_id.clone(), add_c.entry_id.clone()];
+        for ts in 0..10u64 {
+            let rm_ab = SignedMembershipEntry::sign(
+                &a,
+                10 + ts,
+                remove_op(
+                    &base.mesh_id,
+                    b.peer_id(),
+                    parents.clone(),
+                    vec![a.peer_id(), c.peer_id()],
+                ),
+            )
+            .unwrap();
+            let rm_bc = SignedMembershipEntry::sign(
+                &b,
+                20 + ts * 3,
+                remove_op(
+                    &base.mesh_id,
+                    c.peer_id(),
+                    parents.clone(),
+                    vec![a.peer_id(), b.peer_id()],
+                ),
+            )
+            .unwrap();
+            let rm_ca = SignedMembershipEntry::sign(
+                &c,
+                30 + ts * 7,
+                remove_op(
+                    &base.mesh_id,
+                    a.peer_id(),
+                    parents.clone(),
+                    vec![b.peer_id(), c.peer_id()],
+                ),
+            )
+            .unwrap();
+
+            let perms = [
+                vec![rm_ab.clone(), rm_bc.clone(), rm_ca.clone()],
+                vec![rm_ab.clone(), rm_ca.clone(), rm_bc.clone()],
+                vec![rm_bc.clone(), rm_ab.clone(), rm_ca.clone()],
+                vec![rm_bc.clone(), rm_ca.clone(), rm_ab.clone()],
+                vec![rm_ca.clone(), rm_ab.clone(), rm_bc.clone()],
+                vec![rm_ca.clone(), rm_bc.clone(), rm_ab.clone()],
+            ];
+            for p in perms {
+                let mut log = base.clone();
+                log.merge_entries(&p).unwrap();
+                let ev = log.evaluate();
+                assert!(ev.active.is_empty(), "expected all 3 revoked at ts={ts}");
+                assert!(ev.valid.contains(&rm_ab.entry_id));
+                assert!(ev.valid.contains(&rm_bc.entry_id));
+                assert!(ev.valid.contains(&rm_ca.entry_id));
+                assert!(ev.revoked.contains_key(&a.peer_id()));
+                assert!(ev.revoked.contains_key(&b.peer_id()));
+                assert!(ev.revoked.contains_key(&c.peer_id()));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn membership_evaluate_200_entry_chain_under_100ms() {
+        let dir = TempDir::new().unwrap();
+        let a = ident(&dir, "a").await;
+        let mut log = MembershipLog::new_genesis(&a, "A", "n1", 1).unwrap();
+
+        // Build a 200-entry linear chain of SelfDevice adds without calling evaluate() per step.
+        let mut head = log.mesh_id.clone();
+        for i in 0..200u64 {
+            let mut raw = [0u8; 32];
+            raw[0..8].copy_from_slice(&(i + 1).to_le_bytes());
+            let subj = PeerId::from_bytes(raw);
+            let e = SignedMembershipEntry::sign(
+                &a,
+                2 + i,
+                add_op(&log.mesh_id, subj, "S", vec![head]),
+            )
+            .unwrap();
+            head = e.entry_id.clone();
+            log.entries.insert(e.entry_id.clone(), e);
+        }
+
+        let t0 = std::time::Instant::now();
+        let ev = log.evaluate();
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(ev.active.len(), 201);
+        assert!(
+            elapsed_ms < 100.0,
+            "evaluate() on 200-entry chain took {elapsed_ms:.2} ms (limit 100 ms)"
+        );
     }
 }
